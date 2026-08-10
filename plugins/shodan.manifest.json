@@ -2,8 +2,8 @@
   "identifier": "run.vineyard.pluginpacks.shodan",
   "content_type": "vineyard:pluginpack",
   "name": "Shodan",
-  "version": "1.0.0",
-  "description": "Shodan's paid REST API: free-text host search, passive subdomain/DNS discovery, and a key/credit status check. Needs your own api.shodan.io key — nothing here is keyless.",
+  "version": "2.0.0",
+  "description": "Shodan's REST API, one plugin per endpoint: single-IP host lookup, free-text search, a free result count with facets, three DNS lookups (passive history, forward resolve, reverse PTR) and a credit check. Only search spends a query credit. Needs your own api.shodan.io key — nothing here is keyless.",
   "author": {
     "name": "VINEYARD",
     "url": "https://github.com/Vineyard-Intelligence"
@@ -19,15 +19,114 @@
   },
   "plugins": [
     {
+      "identifier": "run.vineyard.plugins.shodan_host",
+      "content_type": "vineyard:plugin",
+      "name": "Shodan Host",
+      "version": "2.0.0",
+      "description": "Looks up everything Shodan knows about each selected IP Address (/shodan/host/{ip}): open ports and the service banners behind them, known CVEs, reverse hostnames, announcing AS, and approximate location. Richer than the free InternetDB lookup in the IP Recon pack — it adds the AS, the geolocation, the per-port product/version banners and Shodan's own tags. Measured FREE: it does not spend a query credit, so this is the right first call on an IP you already have. Product/version and tags are reported in the summary rather than turned into nodes, on purpose — they are pivot queries for Shodan Search, not entities. Needs your own api.shodan.io key in Settings below.",
+      "icon": "server",
+      "author": {
+        "name": "VINEYARD",
+        "url": "https://github.com/Vineyard-Intelligence"
+      },
+      "license": "Apache-2.0",
+      "platforms": {
+        "primary": "web",
+        "web": {
+          "runtime": "sandbox-js",
+          "entry": "dist/pack.mjs"
+        }
+      },
+      "io": {
+        "consumes": [
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "ip_address"
+          }
+        ],
+        "produces": [
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "host"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "autonomous_system"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "domain"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.threat",
+            "category": "threat",
+            "name": "vulnerability"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.geo",
+            "category": "geo",
+            "name": "location"
+          }
+        ]
+      },
+      "scopes": {
+        "graph": [
+          "node:read",
+          "node:create",
+          "node:update",
+          "edge:create"
+        ],
+        "network": [
+          {
+            "endpoint": "https://api.shodan.io/shodan/host",
+            "methods": [
+              "GET"
+            ],
+            "purpose": "Fetch everything Shodan knows about one IP address. The IP is part of the path, so this scope necessarily covers everything under /shodan/host/ — including the search and count endpoints."
+          }
+        ],
+        "config": [
+          {
+            "key": "api_key",
+            "label": "Shodan API Key",
+            "type": "string",
+            "secret": true,
+            "optional": false
+          }
+        ]
+      },
+      "lifecycle": {
+        "persistence": "opt-in",
+        "controls": [
+          "progress",
+          "cancel"
+        ],
+        "progress": "determinate"
+      }
+    },
+    {
       "identifier": "run.vineyard.plugins.shodan_search",
       "content_type": "vineyard:plugin",
       "name": "Shodan Search",
-      "version": "1.0.0",
-      "description": "Runs a free-text Shodan query (host search syntax, e.g. org:\"Example Corp\", hostname:example.com, product:nginx port:443) and materializes up to 100 matching hosts: an IP Address node per host (with its exposing Host, announcing AS, approximate Location, known CVEs and reverse hostnames), reusing the same shapes/edge labels as the free IP Recon pack's Shodan InternetDB plugin. Costs exactly 1 Shodan query credit per run, regardless of how many nodes are selected — this plugin ignores the selection and runs once. Needs your own api.shodan.io key in Settings below.",
+      "version": "2.0.0",
+      "description": "Runs a free-text Shodan query (host search syntax, e.g. org:\"Example Corp\", hostname:example.com, product:nginx port:443, ssl.cert.subject.cn:example.com) and materializes up to 100 matching hosts per page: an IP Address node per host with its exposing Host, announcing AS, approximate Location, known CVEs and reverse hostnames. THE ONLY PLUGIN IN THIS PACK THAT SPENDS A CREDIT — exactly 1 Shodan query credit per run, per page, measured. Run Shodan Count first to see how many hosts a query matches for free. Ignores the selection and runs once. Needs your own api.shodan.io key in Settings below.",
       "icon": "search",
-      "author": { "name": "VINEYARD", "url": "https://github.com/Vineyard-Intelligence" },
+      "author": {
+        "name": "VINEYARD",
+        "url": "https://github.com/Vineyard-Intelligence"
+      },
       "license": "Apache-2.0",
-      "platforms": { "primary": "web", "web": { "runtime": "sandbox-js", "entry": "inline" } },
+      "platforms": {
+        "primary": "web",
+        "web": {
+          "runtime": "sandbox-js",
+          "entry": "dist/pack.mjs"
+        }
+      },
       "params": {
         "type": "object",
         "properties": {
@@ -36,31 +135,65 @@
             "title": "Query",
             "minLength": 1,
             "description": "Shodan search syntax. Examples: org:\"Example Corp\" · hostname:example.com · product:nginx port:443 · ssl.cert.subject.cn:example.com"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page",
+            "minimum": 1,
+            "default": 1,
+            "description": "100 results per page. Each page is a separate query credit."
           }
         },
-        "required": ["query"]
+        "required": [
+          "query"
+        ]
       },
       "io": {
         "consumes": [],
         "produces": [
-          { "typepack": "run.vineyard.typepacks.infrastructure", "category": "infrastructure", "name": "ip_address" },
-          { "typepack": "run.vineyard.typepacks.infrastructure", "category": "infrastructure", "name": "host" },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "ip_address"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "host"
+          },
           {
             "typepack": "run.vineyard.typepacks.infrastructure",
             "category": "infrastructure",
             "name": "autonomous_system"
           },
-          { "typepack": "run.vineyard.typepacks.infrastructure", "category": "infrastructure", "name": "domain" },
-          { "typepack": "run.vineyard.typepacks.threat", "category": "threat", "name": "vulnerability" },
-          { "typepack": "run.vineyard.typepacks.geo", "category": "geo", "name": "location" }
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "domain"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.threat",
+            "category": "threat",
+            "name": "vulnerability"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.geo",
+            "category": "geo",
+            "name": "location"
+          }
         ]
       },
       "scopes": {
-        "graph": ["node:create", "edge:create"],
+        "graph": [
+          "node:create",
+          "edge:create"
+        ],
         "network": [
           {
             "endpoint": "https://api.shodan.io/shodan/host/search",
-            "methods": ["GET"],
+            "methods": [
+              "GET"
+            ],
             "purpose": "Run the query against Shodan's host search index."
           }
         ],
@@ -74,33 +207,137 @@
           }
         ]
       },
-      "lifecycle": { "persistence": "opt-in", "controls": ["progress", "cancel"], "progress": "determinate" }
+      "lifecycle": {
+        "persistence": "opt-in",
+        "controls": [
+          "progress",
+          "cancel"
+        ],
+        "progress": "determinate"
+      }
     },
     {
-      "identifier": "run.vineyard.plugins.shodan_dns",
+      "identifier": "run.vineyard.plugins.shodan_count",
       "content_type": "vineyard:plugin",
-      "name": "Shodan DNS",
-      "version": "1.0.0",
-      "description": "Reads each selected Domain's passively-observed DNS history from Shodan: known subdomains become Domain nodes (\"subdomain\" — same edge label as the free Certificate Transparency plugin, so both read the same way on the canvas), and the underlying A/AAAA/MX/NS/TXT/CAA/… records become DNS Record nodes (\"has record\" — matching the free DNS Lookup plugins' shape). This is Shodan's own cache, not a live query — it can show records the live DNS-over-HTTPS lookups no longer see, and miss ones that changed after Shodan's last crawl. Free — does not spend a query credit. Needs your own api.shodan.io key in Settings below.",
-      "icon": "waypoints",
-      "author": { "name": "VINEYARD", "url": "https://github.com/Vineyard-Intelligence" },
+      "name": "Shodan Count",
+      "version": "2.0.0",
+      "description": "Asks how many hosts a Shodan query matches, and breaks the answer down by facet (country, org, port, product, …) — measured FREE, it does not spend a query credit. Run this before Shodan Search: it tells you whether a query returns 12 hosts or 800,000 (so whether the credit is worth spending), and the facets profile the population without materializing a single node. Reports only — touches nothing on the canvas. Needs your own api.shodan.io key in Settings below.",
+      "icon": "chart-bar",
+      "author": {
+        "name": "VINEYARD",
+        "url": "https://github.com/Vineyard-Intelligence"
+      },
       "license": "Apache-2.0",
-      "platforms": { "primary": "web", "web": { "runtime": "sandbox-js", "entry": "inline" } },
+      "platforms": {
+        "primary": "web",
+        "web": {
+          "runtime": "sandbox-js",
+          "entry": "dist/pack.mjs"
+        }
+      },
+      "params": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "title": "Query",
+            "minLength": 1,
+            "description": "Same syntax as Shodan Search, e.g. org:\"Example Corp\" · product:nginx country:KR"
+          },
+          "facets": {
+            "type": "string",
+            "title": "Facets",
+            "default": "country:5,org:5,port:5,product:5",
+            "description": "Comma-separated facet:count pairs. Blank for the total only."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "io": {
+        "consumes": [],
+        "produces": []
+      },
+      "scopes": {
+        "network": [
+          {
+            "endpoint": "https://api.shodan.io/shodan/host/count",
+            "methods": [
+              "GET"
+            ],
+            "purpose": "Count the hosts matching a query, without spending a credit."
+          }
+        ],
+        "config": [
+          {
+            "key": "api_key",
+            "label": "Shodan API Key",
+            "type": "string",
+            "secret": true,
+            "optional": false
+          }
+        ]
+      },
+      "lifecycle": {
+        "persistence": "ephemeral",
+        "controls": [
+          "cancel"
+        ]
+      }
+    },
+    {
+      "identifier": "run.vineyard.plugins.shodan_dns_domain",
+      "content_type": "vineyard:plugin",
+      "name": "Shodan DNS Domain",
+      "version": "2.0.0",
+      "description": "Reads each selected Domain's passively-observed DNS history from Shodan (/dns/domain): known subdomains become Domain nodes (\"subdomain\" — same edge label as the free Certificate Transparency plugin, so both read the same way on the canvas), and the underlying A/AAAA/MX/NS/TXT/CAA/… records become DNS Record nodes (\"has record\" — matching the free DNS Lookup plugins' shape). This is Shodan's own historical cache, not a live query — it can show records a live DNS-over-HTTPS lookup no longer sees, and miss ones that changed after Shodan's last crawl, so it complements rather than replaces them. Measured FREE. Needs your own api.shodan.io key in Settings below.",
+      "icon": "waypoints",
+      "author": {
+        "name": "VINEYARD",
+        "url": "https://github.com/Vineyard-Intelligence"
+      },
+      "license": "Apache-2.0",
+      "platforms": {
+        "primary": "web",
+        "web": {
+          "runtime": "sandbox-js",
+          "entry": "dist/pack.mjs"
+        }
+      },
       "io": {
         "consumes": [
-          { "typepack": "run.vineyard.typepacks.infrastructure", "category": "infrastructure", "name": "domain" }
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "domain"
+          }
         ],
         "produces": [
-          { "typepack": "run.vineyard.typepacks.infrastructure", "category": "infrastructure", "name": "domain" },
-          { "typepack": "run.vineyard.typepacks.infrastructure", "category": "infrastructure", "name": "dns_record" }
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "domain"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "dns_record"
+          }
         ]
       },
       "scopes": {
-        "graph": ["node:read", "node:create", "edge:create"],
+        "graph": [
+          "node:read",
+          "node:create",
+          "edge:create"
+        ],
         "network": [
           {
             "endpoint": "https://api.shodan.io/dns/domain",
-            "methods": ["GET"],
+            "methods": [
+              "GET"
+            ],
             "purpose": "Fetch a domain's known subdomains and passively-observed DNS records."
           }
         ],
@@ -114,24 +351,184 @@
           }
         ]
       },
-      "lifecycle": { "persistence": "opt-in", "controls": ["progress", "cancel"], "progress": "determinate" }
+      "lifecycle": {
+        "persistence": "opt-in",
+        "controls": [
+          "progress",
+          "cancel"
+        ],
+        "progress": "determinate"
+      }
+    },
+    {
+      "identifier": "run.vineyard.plugins.shodan_dns_resolve",
+      "content_type": "vineyard:plugin",
+      "name": "Shodan DNS Resolve",
+      "version": "2.0.0",
+      "description": "Forward-resolves each selected Domain to its IP address through Shodan (/dns/resolve), creating an IP Address node and a \"resolves to\" edge — the same shape the free Domain Recon A-record lookup produces, so the two agree on the canvas. Resolves up to 25 names per request, so a large selection costs a handful of calls rather than one each. Measured FREE. Use this rather than Shodan DNS Domain when you want the address a name points at right now and not its whole passive history. Needs your own api.shodan.io key in Settings below.",
+      "icon": "arrow-right",
+      "author": {
+        "name": "VINEYARD",
+        "url": "https://github.com/Vineyard-Intelligence"
+      },
+      "license": "Apache-2.0",
+      "platforms": {
+        "primary": "web",
+        "web": {
+          "runtime": "sandbox-js",
+          "entry": "dist/pack.mjs"
+        }
+      },
+      "io": {
+        "consumes": [
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "domain"
+          }
+        ],
+        "produces": [
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "ip_address"
+          }
+        ]
+      },
+      "scopes": {
+        "graph": [
+          "node:read",
+          "node:create",
+          "edge:create"
+        ],
+        "network": [
+          {
+            "endpoint": "https://api.shodan.io/dns/resolve",
+            "methods": [
+              "GET"
+            ],
+            "purpose": "Resolve hostnames to IP addresses."
+          }
+        ],
+        "config": [
+          {
+            "key": "api_key",
+            "label": "Shodan API Key",
+            "type": "string",
+            "secret": true,
+            "optional": false
+          }
+        ]
+      },
+      "lifecycle": {
+        "persistence": "opt-in",
+        "controls": [
+          "progress",
+          "cancel"
+        ],
+        "progress": "determinate"
+      }
+    },
+    {
+      "identifier": "run.vineyard.plugins.shodan_dns_reverse",
+      "content_type": "vineyard:plugin",
+      "name": "Shodan DNS Reverse",
+      "version": "2.0.0",
+      "description": "Reverse-resolves each selected IP Address through Shodan (/dns/reverse): every PTR hostname becomes a Domain node with a \"resolves to\" edge — the same shape the free IP Recon InternetDB plugin produces — and the first one is written back onto the IP node's reverse_dns field. Handles up to 25 addresses per request, so a whole netblock costs a handful of calls. Measured FREE. Needs your own api.shodan.io key in Settings below.",
+      "icon": "arrow-left",
+      "author": {
+        "name": "VINEYARD",
+        "url": "https://github.com/Vineyard-Intelligence"
+      },
+      "license": "Apache-2.0",
+      "platforms": {
+        "primary": "web",
+        "web": {
+          "runtime": "sandbox-js",
+          "entry": "dist/pack.mjs"
+        }
+      },
+      "io": {
+        "consumes": [
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "ip_address"
+          }
+        ],
+        "produces": [
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "domain"
+          }
+        ]
+      },
+      "scopes": {
+        "graph": [
+          "node:read",
+          "node:create",
+          "node:update",
+          "edge:create"
+        ],
+        "network": [
+          {
+            "endpoint": "https://api.shodan.io/dns/reverse",
+            "methods": [
+              "GET"
+            ],
+            "purpose": "Look up the PTR hostnames for IP addresses."
+          }
+        ],
+        "config": [
+          {
+            "key": "api_key",
+            "label": "Shodan API Key",
+            "type": "string",
+            "secret": true,
+            "optional": false
+          }
+        ]
+      },
+      "lifecycle": {
+        "persistence": "opt-in",
+        "controls": [
+          "progress",
+          "cancel"
+        ],
+        "progress": "determinate"
+      }
     },
     {
       "identifier": "run.vineyard.plugins.shodan_api_status",
       "content_type": "vineyard:plugin",
       "name": "Shodan API Status",
-      "version": "1.0.0",
-      "description": "Checks the configured key against api.shodan.io/api-info and reports the plan and remaining query/scan credits — free, does not spend a credit. Run this before a search you are unsure you can afford. Does not touch the graph. Needs your own api.shodan.io key in Settings below.",
+      "version": "2.0.0",
+      "description": "Checks the configured key against api.shodan.io/api-info and reports the plan and remaining query/scan credits — free, does not spend a credit. Shodan Search is the only plugin here that consumes one; run this to see how many are left. Does not touch the graph. Needs your own api.shodan.io key in Settings below.",
       "icon": "gauge",
-      "author": { "name": "VINEYARD", "url": "https://github.com/Vineyard-Intelligence" },
+      "author": {
+        "name": "VINEYARD",
+        "url": "https://github.com/Vineyard-Intelligence"
+      },
       "license": "Apache-2.0",
-      "platforms": { "primary": "web", "web": { "runtime": "sandbox-js", "entry": "inline" } },
-      "io": { "consumes": [], "produces": [] },
+      "platforms": {
+        "primary": "web",
+        "web": {
+          "runtime": "sandbox-js",
+          "entry": "dist/pack.mjs"
+        }
+      },
+      "io": {
+        "consumes": [],
+        "produces": []
+      },
       "scopes": {
         "network": [
           {
             "endpoint": "https://api.shodan.io/api-info",
-            "methods": ["GET"],
+            "methods": [
+              "GET"
+            ],
             "purpose": "Check the configured key's plan and remaining credits."
           }
         ],
@@ -145,7 +542,12 @@
           }
         ]
       },
-      "lifecycle": { "persistence": "ephemeral", "controls": ["cancel"] }
+      "lifecycle": {
+        "persistence": "ephemeral",
+        "controls": [
+          "cancel"
+        ]
+      }
     }
   ]
 }

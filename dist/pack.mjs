@@ -1,28 +1,50 @@
 // Shodan — the paid REST API (api.shodan.io), not the free InternetDB endpoint the IP Recon pack
-// already covers keylessly. Three plugins:
-//   1. shodan_search      — free-text host search (org:"X", hostname:example.com, product:nginx …).
-//                            Costs 1 query credit per run. Selection-independent: runs once.
-//   2. shodan_dns         — a selected Domain's known subdomains + passively-observed DNS records.
-//                            Free (no credit spent). Shodan's own historical cache, not a live query.
-//   3. shodan_api_status  — plan + remaining query/scan credits for the configured key. Free.
+// already covers keylessly. Seven plugins, split one-per-endpoint so a human (or the agent) picks
+// the cheapest call that answers the question instead of reaching for search every time:
+//
+//   1. shodan_host        — /shodan/host/{ip}      everything Shodan knows about ONE ip.   FREE
+//   2. shodan_search      — /shodan/host/search    free-text query over the whole index.   1 CREDIT
+//   3. shodan_count       — /shodan/host/count     how many hosts a query matches, + facets. FREE
+//   4. shodan_dns_domain  — /dns/domain/{domain}   subdomains + passive DNS history.        FREE
+//   5. shodan_dns_resolve — /dns/resolve           forward: hostname -> ip, batched.        FREE
+//   6. shodan_dns_reverse — /dns/reverse           reverse: ip -> hostnames, batched.       FREE
+//   7. shodan_api_status  — /api-info              plan + remaining credits.                FREE
+//
+// Credit costs above are MEASURED against a live `dev` key (before/after /api-info), not read off
+// the docs: only /shodan/host/search moves the counter. That asymmetry is the whole reason these
+// are separate plugins — shodan_count answers "is this query worth a credit?" for free, and
+// shodan_host enriches a known IP for free, so the one paid call is a deliberate choice.
 //
 // Every request carries the analyst's OWN key as `?key=` (Shodan's REST API has no header-auth
 // option), read from ctx.config.api_key — never hardcoded, never logged. `scopes.config` is
 // declared on EACH plugin, not once on the pack: config is stored per PLUGIN identifier (see
-// plugin-config.ts), so there is no pack-level sharing mechanism to reuse here. The analyst pastes
-// the key into Settings on each of the three rows once; after that it is remembered (desktop OS
-// keychain) or held for the session (browser).
+// plugin-config.ts), so there is no pack-level sharing to lean on inside the manifest grammar. The
+// app fans a typed value out to the pack's other members, so the key is pasted once, not seven
+// times.
 //
 // Node/edge shapes deliberately MIRROR the free packs already shipped, rather than inventing a
 // parallel model for the same facts: IP → Host ("exposes"), IP → Vulnerability ("affected by"),
 // IP → Domain ("resolves to") match run.vineyard.pluginpacks.ip_recon's Shodan InternetDB plugin;
-// IP → Autonomous System ("announced by") matches the IP Intelligence pack's IP → ASN plugin;
-// IP → Location ("geolocated to") matches its IP Geolocation plugin; Domain → Domain ("subdomain")
-// matches Domain Recon's Certificate Transparency plugin; Domain → DNS Record ("has record")
-// matches Domain Recon's per-record-type DNS Lookup plugins. A CVE or an AS number reads the same
-// whichever plugin put it on the canvas.
+// Domain → IP ("resolves to") matches Domain Recon's A/AAAA lookups; IP → Autonomous System
+// ("announced by") matches the IP Intelligence pack; IP → Location ("geolocated to") matches IP
+// Recon's IP Geolocation plugin; Domain → Domain ("subdomain") matches Domain Recon's Certificate
+// Transparency plugin; Domain → DNS Record ("has record") matches its DNS Lookup plugins. A CVE or
+// an AS number reads the same whichever plugin put it on the canvas.
+//
+// WHAT IS DELIBERATELY *NOT* A NODE: Shodan's per-service `product`/`version` (Apache httpd 2.4.7,
+// OpenSSH 6.6.1) and its `tags` (cloud, honeypot). Those are pivot *queries*, not entities — a
+// "nginx" node would collide across millions of unrelated hosts and collapse the graph into a hub.
+// They go in the run summary instead, where they are read and fed back into shodan_search.
 
 const API = "https://api.shodan.io";
+
+// Measured: 25 names in one ?hostnames= is fine. Kept well under any URL-length cliff, and small
+// enough that one failed batch loses little.
+const RESOLVE_BATCH = 25;
+const MAX_SUBDOMAINS = 150; // matches the free Certificate Transparency plugin's per-domain cap
+const MAX_RECORDS = 300;
+const MAX_CVES = 25; // per IP — see the note in writeIp
+const PACE_MS = 350; // courteous spacing between sequential calls in a batch
 
 // ---- shared: key, fetch, pacing ------------------------------------------------------------
 
@@ -33,13 +55,20 @@ function apiKey(ctx) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const chunk = (arr, n) => {
+  const out = [];
+  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+  return out;
+};
+
 /**
  * GET one Shodan endpoint with the key attached, one 429 retry, and a uniform result shape.
  *
  * Returns { ok, status, body, error } rather than throwing: every caller needs to tell "no data
- * for this input" (a clean 4xx with a JSON `error`) from "the request itself failed" (network,
- * abort, an HTML error page from a layer in front of the API — measured: a bad key's 401 is HTML,
- * not JSON, so `error` there is the caller's own message rather than a parsed body).
+ * for this input" (a clean 4xx with a JSON `error` — measured: `{"error":"No information available
+ * for that IP."}` at 404 is the normal answer for a quiet host, not a failure) from "the request
+ * itself failed" (network, abort, an HTML error page from a layer in front of the API — measured:
+ * a bad key's 401 is HTML, not JSON, so `.json()` there throws and `body` stays null).
  */
 async function shodanGet(ctx, path, params) {
   const url = new URL(path, API);
@@ -78,10 +107,14 @@ function keyMessage(r) {
   return `Shodan request failed: ${r.error || `HTTP ${r.status}`}`;
 }
 
+const NO_KEY = "No Shodan API key configured — add one in Settings below.";
+
 // ---- shared: node/edge shaping (mirrors the free packs — see file header) -------------------
 
 const isDomain = (n) => n.type === "infrastructure.domain";
 const domainOf = (n) => String((n.data && n.data.domain_name) || (n.data && n.data.value) || "").trim().toLowerCase();
+const isIp = (n) => n.type === "infrastructure.ip_address";
+const ipOf = (n) => String((n.data && n.data.ip_address) || (n.data && n.data.value) || "").trim();
 const ipVersion = (ip) => (String(ip).includes(":") ? "ipv6" : "ipv4");
 const cc2 = (s) => {
   const v = String(s || "").toUpperCase();
@@ -89,6 +122,46 @@ const cc2 = (s) => {
 };
 const CVE_RE = /^CVE-\d{4}-\d{4,}$/i;
 const ASN_RE = /^AS(\d+)$/i;
+
+/** Whichever CVSS base score a Shodan vuln detail happens to carry. Measured: a record can have
+ *  `cvss_v2` and `cvss_version: 2.0` with no plain `cvss` at all, so reading one field name only
+ *  scores half the findings and mis-ranks the rest. */
+function cvssOf(detail) {
+  for (const k of ["cvss_v3", "cvss", "cvss_v2"]) {
+    const n = Number(detail && detail[k]);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+/** Shodan spells `vulns` two ways and both reach this pack: an OBJECT keyed by CVE (with a detail
+ *  carrying the score) on a /host/search match and inside each /shodan/host/{ip} service, a flat
+ *  ARRAY of bare ids at the top level of /shodan/host/{ip}. Measured on both. Non-CVE keys appear
+ *  too, so everything is filtered rather than trusted.
+ *
+ *  Fills `into` as CVE -> score-or-undefined. A score once found is never downgraded to undefined
+ *  by a later bare mention of the same id. */
+function collectVulns(vulns, into) {
+  const entries = Array.isArray(vulns) ? vulns.map((c) => [c, null]) : Object.entries(vulns || {});
+  for (const [cve, detail] of entries) {
+    if (!CVE_RE.test(cve)) continue;
+    const id = String(cve).toUpperCase();
+    const score = cvssOf(detail);
+    if (!into.has(id) || (score !== undefined && into.get(id) === undefined)) into.set(id, score);
+  }
+}
+
+const emptyAgg = (ip) => ({
+  ip,
+  ports: new Set(),
+  cves: new Map(), // CVE id -> CVSS base score, or undefined when Shodan gave none
+  hostnames: new Set(),
+  org: "",
+  isp: "",
+  asn: "",
+  os: "",
+  location: null,
+});
 
 /** Aggregate Shodan search matches by IP — a query can return several rows for one host (one per
  *  scanned port), and mergeNodeData does not UNION array-ish fields across separate createNode
@@ -101,11 +174,11 @@ function aggregateMatches(matches) {
     if (!ip) continue;
     let a = byIp.get(ip);
     if (!a) {
-      a = { ip, ports: new Set(), cves: new Set(), hostnames: new Set(), org: "", isp: "", asn: "", os: "", location: null };
+      a = emptyAgg(ip);
       byIp.set(ip, a);
     }
     if (m.port) a.ports.add(m.port);
-    for (const cve of Object.keys(m.vulns || {})) if (CVE_RE.test(cve)) a.cves.add(cve.toUpperCase());
+    collectVulns(m.vulns, a.cves);
     for (const h of m.hostnames || []) if (h) a.hostnames.add(String(h).trim().toLowerCase());
     if (!a.org && m.org) a.org = m.org;
     if (!a.isp && m.isp) a.isp = m.isp;
@@ -116,23 +189,61 @@ function aggregateMatches(matches) {
   return [...byIp.values()];
 }
 
-/** Write one aggregated IP and everything hanging off it. Returns which node kinds it produced. */
-async function writeIp(ctx, agg, asNodeByAsn) {
-  const made = { ip: false, host: false, as: false, domains: 0, vulns: 0, geo: false };
+/** The same aggregate shape from /shodan/host/{ip}, which reports the SAME facts in a different
+ *  layout: ports/vulns/hostnames are already unioned across services at the top level, and the
+ *  geo fields are flat there rather than nested under `location` as they are on a search match. */
+function aggregateHost(body) {
+  const b = body || {};
+  const a = emptyAgg(String(b.ip_str || ""));
+  for (const p of b.ports || []) if (p) a.ports.add(p);
+  // Per-service first: those detail objects carry the CVSS scores that rank the cap below. The
+  // top-level list is bare ids and only fills in anything the services did not mention.
+  for (const svc of b.data || []) collectVulns(svc && svc.vulns, a.cves);
+  collectVulns(b.vulns, a.cves);
+  for (const h of b.hostnames || []) if (h) a.hostnames.add(String(h).trim().toLowerCase());
+  a.org = b.org || "";
+  a.isp = b.isp || "";
+  a.asn = b.asn || "";
+  a.os = b.os || "";
+  a.location = {
+    city: b.city,
+    region_code: b.region_code,
+    country_code: b.country_code,
+    country_name: b.country_name,
+    latitude: b.latitude,
+    longitude: b.longitude,
+  };
+  return a;
+}
 
-  const asnMatch = ASN_RE.exec(agg.asn || "");
-  const ipNode = await ctx.graph.createNode({
-    type: "infrastructure.ip_address",
-    data: {
-      ip_address: agg.ip,
-      version: ipVersion(agg.ip),
-      ...(cc2(agg.location && agg.location.country_code) ? { country_code: cc2(agg.location.country_code) } : {}),
-      ...(agg.org || agg.isp ? { organization: agg.org || agg.isp } : {}),
-      ...(agg.asn ? { asn: agg.asn.toUpperCase() } : {}),
-    },
-  });
-  made.ip = true;
-  const ipId = String(ipNode.id);
+/** Write one aggregated IP and everything hanging off it. Returns which node kinds it produced.
+ *  `ipId` pins the IP to a node that already exists (the selected one) instead of creating a
+ *  second; identity would merge them anyway, but reusing the selection keeps the edges attached to
+ *  what the analyst is looking at. */
+async function writeIp(ctx, agg, asNodeByAsn, existingIpId) {
+  const made = { ip: false, host: false, as: false, domains: 0, vulns: 0, cvesOmitted: 0, geo: false };
+  const loc = agg.location || {};
+  const country = cc2(loc.country_code);
+  const firstHostname = [...agg.hostnames][0];
+
+  let ipId = existingIpId ? String(existingIpId) : "";
+  const ipData = {
+    ip_address: agg.ip,
+    version: ipVersion(agg.ip),
+    ...(country ? { country_code: country } : {}),
+    ...(agg.org || agg.isp ? { organization: agg.org || agg.isp } : {}),
+    ...(agg.asn ? { asn: String(agg.asn).toUpperCase() } : {}),
+    ...(firstHostname ? { reverse_dns: firstHostname } : {}),
+  };
+  if (ipId) {
+    // Delta, not a snapshot: updateNode merges what it is given, so handing it only the fields
+    // this run actually established is what stops a blank from clobbering another plugin's value.
+    if (ctx.graph.updateNode) await ctx.graph.updateNode(ipId, ipData);
+  } else {
+    const ipNode = await ctx.graph.createNode({ type: "infrastructure.ip_address", data: ipData });
+    ipId = String(ipNode.id);
+    made.ip = true;
+  }
 
   if (agg.ports.size) {
     const hostNode = await ctx.graph.createNode({
@@ -141,12 +252,14 @@ async function writeIp(ctx, agg, asNodeByAsn) {
         hostname: agg.ip,
         open_ports: [...agg.ports].sort((a, b) => a - b).join(", "),
         ...(agg.os ? { operating_system: agg.os } : {}),
+        ...(agg.org || agg.isp ? { hosting_provider: agg.org || agg.isp } : {}),
       },
     });
     await ctx.graph.createEdge({ from: ipId, to: String(hostNode.id), label: "exposes" });
     made.host = true;
   }
 
+  const asnMatch = ASN_RE.exec(agg.asn || "");
   if (asnMatch) {
     const asn = Number(asnMatch[1]);
     let asId = asNodeByAsn.get(asn);
@@ -155,7 +268,7 @@ async function writeIp(ctx, agg, asNodeByAsn) {
         type: "infrastructure.autonomous_system",
         data: {
           autonomous_system_number: asn,
-          ...(cc2(agg.location && agg.location.country_code) ? { country_code: cc2(agg.location.country_code) } : {}),
+          ...(country ? { country_code: country } : {}),
         },
       });
       asId = String(asNode.id);
@@ -165,8 +278,17 @@ async function writeIp(ctx, agg, asNodeByAsn) {
     made.as = true;
   }
 
-  for (const cve of agg.cves) {
-    const vNode = await ctx.graph.createNode({ type: "threat.vulnerability", data: { cve_id: cve } });
+  // Capped, highest CVSS first. Measured: one ordinary old Apache host carries 119 CVEs, so an
+  // uncapped page of 100 search results is >10,000 vulnerability nodes and edges — a graph nobody
+  // can read, for a pack whose job is pivoting. What the cap drops is COUNTED and reported by the
+  // caller rather than silently vanishing, and the survivors are the ones worth looking at.
+  const ranked = [...agg.cves.entries()].sort((x, y) => (y[1] ?? -1) - (x[1] ?? -1));
+  made.cvesOmitted = Math.max(0, ranked.length - MAX_CVES);
+  for (const [cve, cvss] of ranked.slice(0, MAX_CVES)) {
+    const vNode = await ctx.graph.createNode({
+      type: "threat.vulnerability",
+      data: { cve_id: cve, ...(cvss === undefined ? {} : { cvss_score: cvss }) },
+    });
     await ctx.graph.createEdge({ from: ipId, to: String(vNode.id), label: "affected by" });
     made.vulns++;
   }
@@ -177,10 +299,8 @@ async function writeIp(ctx, agg, asNodeByAsn) {
     made.domains++;
   }
 
-  if (agg.location && (agg.location.city || agg.location.country_name || Number.isFinite(agg.location.latitude))) {
-    const loc = agg.location;
-    const cc = cc2(loc.country_code);
-    const name = [loc.city, cc || loc.country_name].filter(Boolean).join(", ") || loc.country_name || agg.ip;
+  if (loc.city || loc.country_name || Number.isFinite(loc.latitude)) {
+    const name = [loc.city, country || loc.country_name].filter(Boolean).join(", ") || loc.country_name || agg.ip;
     const locNode = await ctx.graph.createNode({
       type: "geo.location",
       data: {
@@ -199,20 +319,148 @@ async function writeIp(ctx, agg, asNodeByAsn) {
   return made;
 }
 
-// ---- plugin: Shodan Search -------------------------------------------------------------------
+/** Shared manifest boilerplate — every plugin here is the same author, license and platform, and
+ *  every one needs the analyst's own key. */
+const AUTHOR = { name: "VINEYARD", url: "https://github.com/Vineyard-Intelligence" };
+// `entry` is the PACK's module, repeated on every member — NOT "inline". Measured the hard way:
+// "inline" means "a plugin bundled into the app", nothing is bundled any more, and registry.ts's
+// isRemoteRunnable() drops such a member on the floor. A pack that declares it installs fine,
+// shows nothing in the run dialog, and gives no diagnostic. Every other pack in the catalog says
+// dist/pack.mjs here; test-plugin.mjs now refuses to let this one drift back.
+const PACK_ENTRY = "dist/pack.mjs";
+const WEB = { primary: "web", web: { runtime: "sandbox-js", entry: PACK_ENTRY } };
+const KEY_CONFIG = [{ key: "api_key", label: "Shodan API Key", type: "string", secret: true, optional: false }];
+const T_INFRA = "run.vineyard.typepacks.infrastructure";
+const io = (t, category, name) => ({ typepack: t, category, name });
+
+// ---- plugin: Shodan Host ---------------------------------------------------------------------
+
+const hostPlugin = {
+  manifest: {
+    identifier: "run.vineyard.plugins.shodan_host",
+    content_type: "vineyard:plugin",
+    name: "Shodan Host",
+    version: "2.0.0",
+    description:
+      "Looks up everything Shodan knows about each selected IP Address (/shodan/host/{ip}): open ports and the service banners behind them, known CVEs, reverse hostnames, announcing AS, and approximate location. Richer than the free InternetDB lookup in the IP Recon pack — it adds the AS, the geolocation, the per-port product/version banners and Shodan's own tags. Measured FREE: it does not spend a query credit, so this is the right first call on an IP you already have. Product/version and tags are reported in the summary rather than turned into nodes, on purpose — they are pivot queries for Shodan Search, not entities. Needs your own api.shodan.io key in Settings below.",
+    icon: "server",
+    author: AUTHOR,
+    license: "Apache-2.0",
+    platforms: WEB,
+    io: {
+      consumes: [io(T_INFRA, "infrastructure", "ip_address")],
+      produces: [
+        io(T_INFRA, "infrastructure", "host"),
+        io(T_INFRA, "infrastructure", "autonomous_system"),
+        io(T_INFRA, "infrastructure", "domain"),
+        io("run.vineyard.typepacks.threat", "threat", "vulnerability"),
+        io("run.vineyard.typepacks.geo", "geo", "location"),
+      ],
+    },
+    scopes: {
+      graph: ["node:read", "node:create", "node:update", "edge:create"],
+      network: [
+        {
+          endpoint: "https://api.shodan.io/shodan/host",
+          methods: ["GET"],
+          // The IP is a PATH parameter, and the scope grammar has no wildcard — the narrowest
+          // expressible scope is this prefix, which by segment-boundary matching also covers
+          // /shodan/host/search and /shodan/host/count. Said plainly here because this string is
+          // what the analyst reads at the install gate, and that screen has to be the truth.
+          purpose:
+            "Fetch everything Shodan knows about one IP address. The IP is part of the path, so this scope necessarily covers everything under /shodan/host/ — including the search and count endpoints.",
+        },
+      ],
+      config: KEY_CONFIG,
+    },
+    lifecycle: { persistence: "opt-in", controls: ["progress", "cancel"], progress: "determinate" },
+  },
+  async run(ctx) {
+    if (!apiKey(ctx)) return { summary: NO_KEY, counts: { hosts: 0 } };
+    const ids = ctx.input.selection;
+    if (!ids.length) return { summary: "Select one or more IP Address nodes first", counts: { hosts: 0 } };
+
+    const asNodeByAsn = new Map();
+    const totals = { hosts: 0, ports: 0, vulns: 0, omitted: 0, domains: 0, as: 0, geo: 0 };
+    const products = new Set();
+    const tags = new Set();
+    let unknown = 0;
+    let failed = 0;
+    let looked = 0;
+
+    for (let i = 0; i < ids.length; i++) {
+      if (ctx.signal && ctx.signal.aborted) break;
+      const node = await ctx.graph.get(ids[i]);
+      if (!node || !isIp(node)) continue;
+      const ip = ipOf(node);
+      if (!ip) continue;
+      looked++;
+      ctx.progress &&
+        ctx.progress.set &&
+        ctx.progress.set({ percent: Math.round(((i + 1) / ids.length) * 100), message: `Shodan host: ${ip}` });
+      if (looked > 1) await sleep(PACE_MS);
+
+      const r = await shodanGet(ctx, `/shodan/host/${encodeURIComponent(ip)}`, {});
+      if (!r.ok) {
+        // 404 is the routine answer for an IP Shodan has never scanned — not an error to report as
+        // one, or every quiet host in a selection reads as a broken key.
+        if (r.status === 404) unknown++;
+        else failed++;
+        continue;
+      }
+      const body = r.body || {};
+      for (const t of body.tags || []) if (t) tags.add(String(t));
+      for (const s of body.data || []) {
+        if (s && s.product) products.add(s.version ? `${s.product} ${s.version}` : String(s.product));
+      }
+
+      const agg = aggregateHost(body);
+      if (!agg.ip) agg.ip = ip; // an unusual body without ip_str still belongs to the IP we asked about
+      const made = await writeIp(ctx, agg, asNodeByAsn, ids[i]);
+      totals.hosts++;
+      totals.ports += agg.ports.size;
+      totals.vulns += made.vulns;
+      totals.omitted += made.cvesOmitted;
+      totals.domains += made.domains;
+      if (made.as) totals.as++;
+      if (made.geo) totals.geo++;
+    }
+
+    const notes = [
+      unknown ? `${unknown} IP(s) unknown to Shodan` : "",
+      failed ? `${failed} lookup(s) failed` : "",
+      totals.omitted ? `${totals.omitted} lower-CVSS CVE(s) omitted by the ${MAX_CVES}/host cap` : "",
+      products.size ? `running ${[...products].slice(0, 8).join(", ")}` : "",
+      tags.size ? `tags: ${[...tags].join(", ")}` : "",
+    ].filter(Boolean);
+    return {
+      summary: `${totals.hosts} host(s): ${totals.ports} open port(s), ${totals.vulns} CVE(s), ${totals.domains} hostname(s), ${totals.as} AS(es)${notes.length ? ` — ${notes.join("; ")}` : ""}`,
+      counts: {
+        hosts: totals.hosts,
+        open_ports: totals.ports,
+        vulnerabilities: totals.vulns,
+        domains: totals.domains,
+        unknown,
+        failed,
+      },
+    };
+  },
+};
+
+// ---- plugin: Shodan Search --------------------------------------------------------------------
 
 const searchPlugin = {
   manifest: {
     identifier: "run.vineyard.plugins.shodan_search",
     content_type: "vineyard:plugin",
     name: "Shodan Search",
-    version: "1.0.0",
+    version: "2.0.0",
     description:
-      'Runs a free-text Shodan query (host search syntax, e.g. org:"Example Corp", hostname:example.com, product:nginx port:443) and materializes up to 100 matching hosts: an IP Address node per host (with its exposing Host, announcing AS, approximate Location, known CVEs and reverse hostnames), reusing the same shapes/edge labels as the free IP Recon pack\'s Shodan InternetDB plugin. Costs exactly 1 Shodan query credit per run, regardless of how many nodes are selected — this plugin ignores the selection and runs once. Needs your own api.shodan.io key in Settings below.',
+      'Runs a free-text Shodan query (host search syntax, e.g. org:"Example Corp", hostname:example.com, product:nginx port:443, ssl.cert.subject.cn:example.com) and materializes up to 100 matching hosts per page: an IP Address node per host with its exposing Host, announcing AS, approximate Location, known CVEs and reverse hostnames. THE ONLY PLUGIN IN THIS PACK THAT SPENDS A CREDIT — exactly 1 Shodan query credit per run, per page, measured. Run Shodan Count first to see how many hosts a query matches for free. Ignores the selection and runs once. Needs your own api.shodan.io key in Settings below.',
     icon: "search",
-    author: { name: "VINEYARD", url: "https://github.com/Vineyard-Intelligence" },
+    author: AUTHOR,
     license: "Apache-2.0",
-    platforms: { primary: "web", web: { runtime: "sandbox-js", entry: "inline" } },
+    platforms: WEB,
     params: {
       type: "object",
       properties: {
@@ -223,18 +471,25 @@ const searchPlugin = {
           description:
             'Shodan search syntax. Examples: org:"Example Corp" · hostname:example.com · product:nginx port:443 · ssl.cert.subject.cn:example.com',
         },
+        page: {
+          type: "integer",
+          title: "Page",
+          minimum: 1,
+          default: 1,
+          description: "100 results per page. Each page is a separate query credit.",
+        },
       },
       required: ["query"],
     },
     io: {
       consumes: [],
       produces: [
-        { typepack: "run.vineyard.typepacks.infrastructure", category: "infrastructure", name: "ip_address" },
-        { typepack: "run.vineyard.typepacks.infrastructure", category: "infrastructure", name: "host" },
-        { typepack: "run.vineyard.typepacks.infrastructure", category: "infrastructure", name: "autonomous_system" },
-        { typepack: "run.vineyard.typepacks.infrastructure", category: "infrastructure", name: "domain" },
-        { typepack: "run.vineyard.typepacks.threat", category: "threat", name: "vulnerability" },
-        { typepack: "run.vineyard.typepacks.geo", category: "geo", name: "location" },
+        io(T_INFRA, "infrastructure", "ip_address"),
+        io(T_INFRA, "infrastructure", "host"),
+        io(T_INFRA, "infrastructure", "autonomous_system"),
+        io(T_INFRA, "infrastructure", "domain"),
+        io("run.vineyard.typepacks.threat", "threat", "vulnerability"),
+        io("run.vineyard.typepacks.geo", "geo", "location"),
       ],
     },
     scopes: {
@@ -246,17 +501,18 @@ const searchPlugin = {
           purpose: "Run the query against Shodan's host search index.",
         },
       ],
-      config: [{ key: "api_key", label: "Shodan API Key", type: "string", secret: true, optional: false }],
+      config: KEY_CONFIG,
     },
     lifecycle: { persistence: "opt-in", controls: ["progress", "cancel"], progress: "determinate" },
   },
   async run(ctx) {
-    const key = apiKey(ctx);
-    if (!key) return { summary: "No Shodan API key configured — add one in Settings below.", counts: { ips: 0 } };
+    if (!apiKey(ctx)) return { summary: NO_KEY, counts: { ips: 0 } };
     const query = String((ctx.params && ctx.params.query) || "").trim();
     if (!query) return { summary: "Enter a Shodan search query first.", counts: { ips: 0 } };
+    const pageRaw = Number((ctx.params && ctx.params.page) || 1);
+    const page = Number.isFinite(pageRaw) && pageRaw >= 1 ? Math.floor(pageRaw) : 1;
 
-    const r = await shodanGet(ctx, "/shodan/host/search", { query });
+    const r = await shodanGet(ctx, "/shodan/host/search", { query, ...(page > 1 ? { page } : {}) });
     if (!r.ok) return { summary: keyMessage(r), counts: { ips: 0 } };
     const total = Number(r.body && r.body.total) || 0;
     const matches = (r.body && r.body.matches) || [];
@@ -264,7 +520,7 @@ const searchPlugin = {
 
     const aggregated = aggregateMatches(matches);
     const asNodeByAsn = new Map();
-    const totals = { ip: 0, host: 0, as: 0, domains: 0, vulns: 0, geo: 0 };
+    const totals = { ip: 0, host: 0, as: 0, domains: 0, vulns: 0, omitted: 0, geo: 0 };
     for (let i = 0; i < aggregated.length; i++) {
       if (ctx.signal && ctx.signal.aborted) break;
       ctx.progress &&
@@ -277,39 +533,103 @@ const searchPlugin = {
       if (made.geo) totals.geo++;
       totals.domains += made.domains;
       totals.vulns += made.vulns;
+      totals.omitted += made.cvesOmitted;
     }
-    const more = total > matches.length ? ` — ${total - matches.length} more match this query in Shodan's index` : "";
+    const capped = totals.omitted ? `, ${totals.omitted} lower-CVSS CVE(s) omitted by the ${MAX_CVES}/host cap` : "";
+    const seen = page * 100;
+    const more = total > seen ? ` — ${total - seen} more match this query (raise Page for the next 100, 1 credit each)` : "";
     return {
-      summary: `"${query}": ${totals.ip} host(s), ${totals.host} exposing ports, ${totals.as} AS(es), ${totals.vulns} CVE(s), ${totals.geo} geolocated${more}`,
+      summary: `"${query}" p${page}: ${totals.ip} host(s), ${totals.host} exposing ports, ${totals.as} AS(es), ${totals.vulns} CVE(s), ${totals.geo} geolocated${capped}${more}`,
       counts: { ips: totals.ip, hosts: totals.host, autonomous_systems: totals.as, vulnerabilities: totals.vulns, locations: totals.geo },
     };
   },
 };
 
-// ---- plugin: Shodan DNS ------------------------------------------------------------------------
+// ---- plugin: Shodan Count ---------------------------------------------------------------------
 
-const MAX_SUBDOMAINS = 150; // matches the free Certificate Transparency plugin's per-domain cap
-const MAX_RECORDS = 300;
-const DNS_PACE_MS = 350; // courteous spacing between sequential /dns/domain calls in a batch
-
-const dnsPlugin = {
+const countPlugin = {
   manifest: {
-    identifier: "run.vineyard.plugins.shodan_dns",
+    identifier: "run.vineyard.plugins.shodan_count",
     content_type: "vineyard:plugin",
-    name: "Shodan DNS",
-    version: "1.0.0",
+    name: "Shodan Count",
+    version: "2.0.0",
     description:
-      'Reads each selected Domain\'s passively-observed DNS history from Shodan: known subdomains become Domain nodes ("subdomain" — same edge label as the free Certificate Transparency plugin, so both read the same way on the canvas), and the underlying A/AAAA/MX/NS/TXT/CAA/… records become DNS Record nodes ("has record" — matching the free DNS Lookup plugins\' shape). This is Shodan\'s own cache, not a live query — it can show records the live DNS-over-HTTPS lookups no longer see, and miss ones that changed after Shodan\'s last crawl. Free — does not spend a query credit. Needs your own api.shodan.io key in Settings below.',
-    icon: "waypoints",
-    author: { name: "VINEYARD", url: "https://github.com/Vineyard-Intelligence" },
+      'Asks how many hosts a Shodan query matches, and breaks the answer down by facet (country, org, port, product, …) — measured FREE, it does not spend a query credit. Run this before Shodan Search: it tells you whether a query returns 12 hosts or 800,000 (so whether the credit is worth spending), and the facets profile the population without materializing a single node. Reports only — touches nothing on the canvas. Needs your own api.shodan.io key in Settings below.',
+    icon: "chart-bar",
+    author: AUTHOR,
     license: "Apache-2.0",
-    platforms: { primary: "web", web: { runtime: "sandbox-js", entry: "inline" } },
-    io: {
-      consumes: [{ typepack: "run.vineyard.typepacks.infrastructure", category: "infrastructure", name: "domain" }],
-      produces: [
-        { typepack: "run.vineyard.typepacks.infrastructure", category: "infrastructure", name: "domain" },
-        { typepack: "run.vineyard.typepacks.infrastructure", category: "infrastructure", name: "dns_record" },
+    platforms: WEB,
+    params: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          title: "Query",
+          minLength: 1,
+          description: 'Same syntax as Shodan Search, e.g. org:"Example Corp" · product:nginx country:KR',
+        },
+        facets: {
+          type: "string",
+          title: "Facets",
+          default: "country:5,org:5,port:5,product:5",
+          description: "Comma-separated facet:count pairs. Blank for the total only.",
+        },
+      },
+      required: ["query"],
+    },
+    io: { consumes: [], produces: [] },
+    scopes: {
+      network: [
+        {
+          endpoint: "https://api.shodan.io/shodan/host/count",
+          methods: ["GET"],
+          purpose: "Count the hosts matching a query, without spending a credit.",
+        },
       ],
+      config: KEY_CONFIG,
+    },
+    lifecycle: { persistence: "ephemeral", controls: ["cancel"] },
+  },
+  async run(ctx) {
+    if (!apiKey(ctx)) return { summary: NO_KEY, counts: {} };
+    const query = String((ctx.params && ctx.params.query) || "").trim();
+    if (!query) return { summary: "Enter a Shodan search query first.", counts: {} };
+    const facets = String((ctx.params && ctx.params.facets) ?? "country:5,org:5,port:5,product:5").trim();
+
+    const r = await shodanGet(ctx, "/shodan/host/count", { query, facets });
+    if (!r.ok) return { summary: keyMessage(r), counts: {} };
+    const total = Number(r.body && r.body.total) || 0;
+    const facetOut = (r.body && r.body.facets) || {};
+    // A query with no hits still returns every facet as an empty list; printing those is pure
+    // noise on the one result that most needs to read clearly ("0 host(s) match").
+    const lines = Object.keys(facetOut)
+      .filter((k) => (facetOut[k] || []).length)
+      .map((k) => `${k}: ${facetOut[k].map((f) => `${f.value} (${f.count})`).join(", ")}`);
+    return {
+      summary: `${total.toLocaleString("en-US")} host(s) match "${query}"${lines.length ? ` · ${lines.join(" · ")}` : ""}`,
+      counts: { total },
+      data: { total, facets: facetOut },
+    };
+  },
+};
+
+// ---- plugin: Shodan DNS Domain -----------------------------------------------------------------
+
+const dnsDomainPlugin = {
+  manifest: {
+    identifier: "run.vineyard.plugins.shodan_dns_domain",
+    content_type: "vineyard:plugin",
+    name: "Shodan DNS Domain",
+    version: "2.0.0",
+    description:
+      'Reads each selected Domain\'s passively-observed DNS history from Shodan (/dns/domain): known subdomains become Domain nodes ("subdomain" — same edge label as the free Certificate Transparency plugin, so both read the same way on the canvas), and the underlying A/AAAA/MX/NS/TXT/CAA/… records become DNS Record nodes ("has record" — matching the free DNS Lookup plugins\' shape). This is Shodan\'s own historical cache, not a live query — it can show records a live DNS-over-HTTPS lookup no longer sees, and miss ones that changed after Shodan\'s last crawl, so it complements rather than replaces them. Measured FREE. Needs your own api.shodan.io key in Settings below.',
+    icon: "waypoints",
+    author: AUTHOR,
+    license: "Apache-2.0",
+    platforms: WEB,
+    io: {
+      consumes: [io(T_INFRA, "infrastructure", "domain")],
+      produces: [io(T_INFRA, "infrastructure", "domain"), io(T_INFRA, "infrastructure", "dns_record")],
     },
     scopes: {
       graph: ["node:read", "node:create", "edge:create"],
@@ -320,13 +640,12 @@ const dnsPlugin = {
           purpose: "Fetch a domain's known subdomains and passively-observed DNS records.",
         },
       ],
-      config: [{ key: "api_key", label: "Shodan API Key", type: "string", secret: true, optional: false }],
+      config: KEY_CONFIG,
     },
     lifecycle: { persistence: "opt-in", controls: ["progress", "cancel"], progress: "determinate" },
   },
   async run(ctx) {
-    const key = apiKey(ctx);
-    if (!key) return { summary: "No Shodan API key configured — add one in Settings below.", counts: { subdomains: 0, dns_records: 0 } };
+    if (!apiKey(ctx)) return { summary: NO_KEY, counts: { subdomains: 0, dns_records: 0 } };
     const ids = ctx.input.selection;
     if (!ids.length) return { summary: "Select one or more Domain nodes first", counts: { subdomains: 0, dns_records: 0 } };
 
@@ -335,16 +654,18 @@ const dnsPlugin = {
     let truncatedSubs = 0;
     let truncatedRecs = 0;
     let failed = 0;
+    let looked = 0;
     for (let i = 0; i < ids.length; i++) {
       if (ctx.signal && ctx.signal.aborted) break;
       const node = await ctx.graph.get(ids[i]);
       if (!node || !isDomain(node)) continue;
       const domain = domainOf(node);
       if (!domain) continue;
+      looked++;
       ctx.progress &&
         ctx.progress.set &&
         ctx.progress.set({ percent: Math.round(((i + 1) / ids.length) * 100), message: `Shodan DNS: ${domain}` });
-      if (i > 0) await sleep(DNS_PACE_MS);
+      if (looked > 1) await sleep(PACE_MS);
 
       const r = await shodanGet(ctx, `/dns/domain/${encodeURIComponent(domain)}`, {});
       if (!r.ok) {
@@ -393,8 +714,185 @@ const dnsPlugin = {
       failed ? `${failed} domain(s) failed` : "",
     ].filter(Boolean);
     return {
-      summary: `${subdomains} subdomain(s), ${records} DNS record(s) from ${ids.length - failed}/${ids.length} domain(s)${notes.length ? ` (${notes.join("; ")})` : ""}`,
+      summary: `${subdomains} subdomain(s), ${records} DNS record(s) from ${looked - failed}/${ids.length} domain(s)${notes.length ? ` (${notes.join("; ")})` : ""}`,
       counts: { subdomains, dns_records: records, failed },
+    };
+  },
+};
+
+// ---- plugin: Shodan DNS Resolve ----------------------------------------------------------------
+
+const dnsResolvePlugin = {
+  manifest: {
+    identifier: "run.vineyard.plugins.shodan_dns_resolve",
+    content_type: "vineyard:plugin",
+    name: "Shodan DNS Resolve",
+    version: "2.0.0",
+    description:
+      'Forward-resolves each selected Domain to its IP address through Shodan (/dns/resolve), creating an IP Address node and a "resolves to" edge — the same shape the free Domain Recon A-record lookup produces, so the two agree on the canvas. Resolves up to 25 names per request, so a large selection costs a handful of calls rather than one each. Measured FREE. Use this rather than Shodan DNS Domain when you want the address a name points at right now and not its whole passive history. Needs your own api.shodan.io key in Settings below.',
+    icon: "arrow-right",
+    author: AUTHOR,
+    license: "Apache-2.0",
+    platforms: WEB,
+    io: {
+      consumes: [io(T_INFRA, "infrastructure", "domain")],
+      produces: [io(T_INFRA, "infrastructure", "ip_address")],
+    },
+    scopes: {
+      graph: ["node:read", "node:create", "edge:create"],
+      network: [
+        {
+          endpoint: "https://api.shodan.io/dns/resolve",
+          methods: ["GET"],
+          purpose: "Resolve hostnames to IP addresses.",
+        },
+      ],
+      config: KEY_CONFIG,
+    },
+    lifecycle: { persistence: "opt-in", controls: ["progress", "cancel"], progress: "determinate" },
+  },
+  async run(ctx) {
+    if (!apiKey(ctx)) return { summary: NO_KEY, counts: { ips: 0 } };
+    const ids = ctx.input.selection;
+    if (!ids.length) return { summary: "Select one or more Domain nodes first", counts: { ips: 0 } };
+
+    // Collect first, request in batches — one call per 25 names instead of one per name.
+    const idByName = new Map();
+    for (const id of ids) {
+      const node = await ctx.graph.get(id);
+      if (!node || !isDomain(node)) continue;
+      const d = domainOf(node);
+      if (d && !idByName.has(d)) idByName.set(d, id);
+    }
+    const names = [...idByName.keys()];
+    if (!names.length) return { summary: "No Domain nodes in the selection", counts: { ips: 0 } };
+
+    const batches = chunk(names, RESOLVE_BATCH);
+    let ips = 0;
+    let unresolved = 0;
+    let failed = 0;
+    for (let b = 0; b < batches.length; b++) {
+      if (ctx.signal && ctx.signal.aborted) break;
+      ctx.progress &&
+        ctx.progress.set &&
+        ctx.progress.set({ percent: Math.round(((b + 1) / batches.length) * 100), message: `Resolving ${batches[b].length} name(s)` });
+      if (b > 0) await sleep(PACE_MS);
+      const r = await shodanGet(ctx, "/dns/resolve", { hostnames: batches[b].join(",") });
+      if (!r.ok) {
+        failed += batches[b].length;
+        continue;
+      }
+      const body = r.body || {};
+      for (const name of batches[b]) {
+        const ip = body[name];
+        // A name Shodan cannot resolve comes back as an explicit null, not a missing key.
+        if (!ip || typeof ip !== "string") {
+          unresolved++;
+          continue;
+        }
+        const ipNode = await ctx.graph.createNode({
+          type: "infrastructure.ip_address",
+          data: { ip_address: ip, version: ipVersion(ip) },
+        });
+        await ctx.graph.createEdge({ from: idByName.get(name), to: String(ipNode.id), label: "resolves to" });
+        ips++;
+      }
+    }
+    const notes = [unresolved ? `${unresolved} did not resolve` : "", failed ? `${failed} failed` : ""].filter(Boolean);
+    return {
+      summary: `${ips} IP(s) from ${names.length} name(s) in ${batches.length} request(s)${notes.length ? ` (${notes.join("; ")})` : ""}`,
+      counts: { ips, unresolved, failed },
+    };
+  },
+};
+
+// ---- plugin: Shodan DNS Reverse ----------------------------------------------------------------
+
+const dnsReversePlugin = {
+  manifest: {
+    identifier: "run.vineyard.plugins.shodan_dns_reverse",
+    content_type: "vineyard:plugin",
+    name: "Shodan DNS Reverse",
+    version: "2.0.0",
+    description:
+      'Reverse-resolves each selected IP Address through Shodan (/dns/reverse): every PTR hostname becomes a Domain node with a "resolves to" edge — the same shape the free IP Recon InternetDB plugin produces — and the first one is written back onto the IP node\'s reverse_dns field. Handles up to 25 addresses per request, so a whole netblock costs a handful of calls. Measured FREE. Needs your own api.shodan.io key in Settings below.',
+    icon: "arrow-left",
+    author: AUTHOR,
+    license: "Apache-2.0",
+    platforms: WEB,
+    io: {
+      consumes: [io(T_INFRA, "infrastructure", "ip_address")],
+      produces: [io(T_INFRA, "infrastructure", "domain")],
+    },
+    scopes: {
+      graph: ["node:read", "node:create", "node:update", "edge:create"],
+      network: [
+        {
+          endpoint: "https://api.shodan.io/dns/reverse",
+          methods: ["GET"],
+          purpose: "Look up the PTR hostnames for IP addresses.",
+        },
+      ],
+      config: KEY_CONFIG,
+    },
+    lifecycle: { persistence: "opt-in", controls: ["progress", "cancel"], progress: "determinate" },
+  },
+  async run(ctx) {
+    if (!apiKey(ctx)) return { summary: NO_KEY, counts: { domains: 0 } };
+    const ids = ctx.input.selection;
+    if (!ids.length) return { summary: "Select one or more IP Address nodes first", counts: { domains: 0 } };
+
+    const idByIp = new Map();
+    for (const id of ids) {
+      const node = await ctx.graph.get(id);
+      if (!node || !isIp(node)) continue;
+      const ip = ipOf(node);
+      if (ip && !idByIp.has(ip)) idByIp.set(ip, id);
+    }
+    const addrs = [...idByIp.keys()];
+    if (!addrs.length) return { summary: "No IP Address nodes in the selection", counts: { domains: 0 } };
+
+    const batches = chunk(addrs, RESOLVE_BATCH);
+    let domains = 0;
+    let none = 0;
+    let failed = 0;
+    for (let b = 0; b < batches.length; b++) {
+      if (ctx.signal && ctx.signal.aborted) break;
+      ctx.progress &&
+        ctx.progress.set &&
+        ctx.progress.set({ percent: Math.round(((b + 1) / batches.length) * 100), message: `Reversing ${batches[b].length} address(es)` });
+      if (b > 0) await sleep(PACE_MS);
+      const r = await shodanGet(ctx, "/dns/reverse", { ips: batches[b].join(",") });
+      if (!r.ok) {
+        failed += batches[b].length;
+        continue;
+      }
+      const body = r.body || {};
+      for (const ip of batches[b]) {
+        const names = body[ip];
+        // An address with no PTR comes back as an explicit null, not a missing key.
+        if (!Array.isArray(names) || !names.length) {
+          none++;
+          continue;
+        }
+        const ipId = idByIp.get(ip);
+        let first = "";
+        for (const raw of names) {
+          const name = String(raw || "").trim().toLowerCase();
+          if (!name) continue;
+          if (!first) first = name;
+          const dNode = await ctx.graph.createNode({ type: "infrastructure.domain", data: { domain_name: name } });
+          await ctx.graph.createEdge({ from: ipId, to: String(dNode.id), label: "resolves to" });
+          domains++;
+        }
+        // Delta write: only the one field this run established. See writeIp's note.
+        if (first && ctx.graph.updateNode) await ctx.graph.updateNode(ipId, { reverse_dns: first });
+      }
+    }
+    const notes = [none ? `${none} had no PTR` : "", failed ? `${failed} failed` : ""].filter(Boolean);
+    return {
+      summary: `${domains} hostname(s) from ${addrs.length} address(es) in ${batches.length} request(s)${notes.length ? ` (${notes.join("; ")})` : ""}`,
+      counts: { domains, no_ptr: none, failed },
     };
   },
 };
@@ -406,13 +904,13 @@ const statusPlugin = {
     identifier: "run.vineyard.plugins.shodan_api_status",
     content_type: "vineyard:plugin",
     name: "Shodan API Status",
-    version: "1.0.0",
+    version: "2.0.0",
     description:
-      "Checks the configured key against api.shodan.io/api-info and reports the plan and remaining query/scan credits — free, does not spend a credit. Run this before a search you are unsure you can afford. Does not touch the graph. Needs your own api.shodan.io key in Settings below.",
+      "Checks the configured key against api.shodan.io/api-info and reports the plan and remaining query/scan credits — free, does not spend a credit. Shodan Search is the only plugin here that consumes one; run this to see how many are left. Does not touch the graph. Needs your own api.shodan.io key in Settings below.",
     icon: "gauge",
-    author: { name: "VINEYARD", url: "https://github.com/Vineyard-Intelligence" },
+    author: AUTHOR,
     license: "Apache-2.0",
-    platforms: { primary: "web", web: { runtime: "sandbox-js", entry: "inline" } },
+    platforms: WEB,
     io: { consumes: [], produces: [] },
     scopes: {
       network: [
@@ -422,18 +920,17 @@ const statusPlugin = {
           purpose: "Check the configured key's plan and remaining credits.",
         },
       ],
-      config: [{ key: "api_key", label: "Shodan API Key", type: "string", secret: true, optional: false }],
+      config: KEY_CONFIG,
     },
     lifecycle: { persistence: "ephemeral", controls: ["cancel"] },
   },
   async run(ctx) {
-    const key = apiKey(ctx);
-    if (!key) return { summary: "No Shodan API key configured — add one in Settings below.", counts: {} };
+    if (!apiKey(ctx)) return { summary: NO_KEY, counts: {} };
     const r = await shodanGet(ctx, "/api-info", {});
     if (!r.ok) return { summary: keyMessage(r), counts: {} };
     const b = r.body || {};
     return {
-      summary: `Plan: ${b.plan || "unknown"} · ${b.query_credits ?? "?"} query credit(s), ${b.scan_credits ?? "?"} scan credit(s), ${b.monitored_ips ?? 0} monitored IP(s) remaining`,
+      summary: `Plan: ${b.plan || "unknown"} · ${b.query_credits ?? "?"} query credit(s), ${b.scan_credits ?? "?"} scan credit(s), ${b.monitored_ips ?? 0} monitored IP(s)`,
       counts: {
         query_credits: Number.isFinite(b.query_credits) ? b.query_credits : undefined,
         scan_credits: Number.isFinite(b.scan_credits) ? b.scan_credits : undefined,
@@ -449,20 +946,20 @@ const statusPlugin = {
 // dynamic `import()` of JSON needs import-attribute syntax whose support is still inconsistent
 // across engines — a SyntaxError there fails the whole pack rather than one plugin. Every other
 // pack in this catalog inlines its manifest as a literal for the same reason (see
-// pluginpack-telegram/dist/pack.mjs); check-shodan-pack.mjs pins this copy against the JSON file
-// so the two cannot drift silently.
+// pluginpack-telegram/dist/pack.mjs); test-plugin.mjs pins this copy against the JSON file so the
+// two cannot drift silently.
 export default {
   manifest: {
     identifier: "run.vineyard.pluginpacks.shodan",
     content_type: "vineyard:pluginpack",
     name: "Shodan",
-    version: "1.0.0",
+    version: "2.0.0",
     description:
-      "Shodan's paid REST API: free-text host search, passive subdomain/DNS discovery, and a key/credit status check. Needs your own api.shodan.io key — nothing here is keyless.",
-    author: { name: "VINEYARD", url: "https://github.com/Vineyard-Intelligence" },
+      "Shodan's REST API, one plugin per endpoint: single-IP host lookup, free-text search, a free result count with facets, three DNS lookups (passive history, forward resolve, reverse PTR) and a credit check. Only search spends a query credit. Needs your own api.shodan.io key — nothing here is keyless.",
+    author: AUTHOR,
     license: "Apache-2.0",
     icon: "radar",
-    platforms: { primary: "web", web: { runtime: "sandbox-js", entry: "dist/pack.mjs" } },
+    platforms: { primary: "web", web: { runtime: "sandbox-js", entry: PACK_ENTRY } },
   },
-  plugins: [searchPlugin, dnsPlugin, statusPlugin],
+  plugins: [hostPlugin, searchPlugin, countPlugin, dnsDomainPlugin, dnsResolvePlugin, dnsReversePlugin, statusPlugin],
 };

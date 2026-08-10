@@ -1,25 +1,25 @@
 # Shodan
 
-A Vineyard **plugin pack** for Shodan's paid REST API (`api.shodan.io`). Needs your **own** Shodan
-API key — nothing here is keyless. For free, keyless IP enrichment (including Shodan's own free
+A Vineyard **plugin pack** for Shodan's REST API (`api.shodan.io`). Needs your **own** Shodan API
+key — nothing here is keyless. For free, keyless IP enrichment (including Shodan's own free
 InternetDB endpoint), see the **IP Recon** pack instead.
 
-Three plugins:
+One plugin per endpoint, so you pick the cheapest call that answers the question instead of
+reaching for search every time. **Only Shodan Search spends a query credit.** Every cost below is
+measured against a live `dev` key by reading `/api-info` before and after — not read off the docs.
 
-- **Shodan Search** — runs a free-text host-search query (`org:"Example Corp"`,
-  `hostname:example.com`, `product:nginx port:443`, …) and materializes up to 100 matching hosts:
-  an **IP Address** node per host, with its exposing **Host** (`exposes`), announcing
-  **Autonomous System** (`announced by`), approximate **Location** (`geolocated to`), known
-  **Vulnerability** nodes (`affected by`) and reverse **Domain** nodes (`resolves to`). Ignores the
-  canvas selection and runs once per invocation — costs exactly **1 query credit** per run,
-  regardless of how much it selects or creates.
-- **Shodan DNS** — reads a selected **Domain**'s passively-observed DNS history: known subdomains
-  become **Domain** nodes (`subdomain`), and the underlying records (A/AAAA/MX/NS/TXT/CAA/…) become
-  **DNS Record** nodes (`has record`). This is Shodan's own cache, not a live query — it can show
-  records a live DNS-over-HTTPS lookup no longer sees, and miss ones that changed since Shodan's
-  last crawl. **Free** — does not spend a query credit.
-- **Shodan API Status** — checks the configured key's plan and remaining query/scan credits. Run
-  this before a search you are not sure you can afford. **Free**, touches nothing on the canvas.
+| Plugin | Endpoint | Cost | Takes | Gives |
+| --- | --- | --- | --- | --- |
+| **Shodan Host** | `/shodan/host/{ip}` | free | selected IP Address nodes | ports, CVEs, reverse hostnames, AS, location — and product/version banners in the summary |
+| **Shodan Search** | `/shodan/host/search` | **1 credit / page** | a query string | up to 100 hosts per page, same shapes as Host |
+| **Shodan Count** | `/shodan/host/count` | free | a query string | how many hosts match, plus facets — no nodes |
+| **Shodan DNS Domain** | `/dns/domain/{domain}` | free | selected Domain nodes | known subdomains + passive DNS records |
+| **Shodan DNS Resolve** | `/dns/resolve` | free | selected Domain nodes | the IP each name points at (25 per request) |
+| **Shodan DNS Reverse** | `/dns/reverse` | free | selected IP Address nodes | PTR hostnames (25 per request) |
+| **Shodan API Status** | `/api-info` | free | — | plan and remaining credits |
+
+The intended loop: **Count** to see whether a query is worth a credit → **Search** to spend it →
+**Host** / **DNS** to expand what came back, for free.
 
 ## Node/edge shapes match the free packs already shipped
 
@@ -27,43 +27,68 @@ Rather than invent a parallel model for the same facts, this pack reuses the exa
 edge labels the free packs already established, so a CVE or an AS number reads the same on the
 canvas whichever plugin put it there:
 
-| Fact                  | Node type                            | Edge label      | Matches                                            |
-| ---------------------- | ------------------------------------- | ---------------- | --------------------------------------------------- |
-| Open ports              | `infrastructure.host`                 | `exposes`         | IP Recon → Shodan InternetDB                        |
-| Known CVE                | `threat.vulnerability`                | `affected by`     | IP Recon → Shodan InternetDB                        |
-| Reverse hostname          | `infrastructure.domain`               | `resolves to`     | IP Recon → Shodan InternetDB                        |
-| Announcing AS             | `infrastructure.autonomous_system`    | `announced by`    | IP Intelligence → IP → ASN                           |
-| Approximate location       | `geo.location`                        | `geolocated to`   | IP Recon → IP Geolocation                            |
-| Subdomain                 | `infrastructure.domain`               | `subdomain`       | Domain Recon → Certificate Transparency               |
-| DNS record                | `infrastructure.dns_record`           | `has record`      | Domain Recon → DNS Lookup (per-record-type plugins)    |
+| Fact | Node type | Edge label | Matches |
+| --- | --- | --- | --- |
+| Open ports | `infrastructure.host` | `exposes` | IP Recon → Shodan InternetDB |
+| Known CVE | `threat.vulnerability` | `affected by` | IP Recon → Shodan InternetDB |
+| Reverse hostname | `infrastructure.domain` | `resolves to` | IP Recon → Shodan InternetDB |
+| Forward resolution | `infrastructure.ip_address` | `resolves to` | Domain Recon → DNS Lookup (A/AAAA) |
+| Announcing AS | `infrastructure.autonomous_system` | `announced by` | IP Intelligence → IP → ASN |
+| Approximate location | `geo.location` | `geolocated to` | IP Recon → IP Geolocation |
+| Subdomain | `infrastructure.domain` | `subdomain` | Domain Recon → Certificate Transparency |
+| DNS record | `infrastructure.dns_record` | `has record` | Domain Recon → DNS Lookup |
+
+### What is deliberately *not* a node
+
+- **Product and version** (`Apache httpd 2.4.7`, `OpenSSH 6.6.1p1`) and **Shodan tags** (`cloud`,
+  `honeypot`) are reported in the run summary instead. They are pivot *queries* — you read them and
+  feed them back into Shodan Search — not entities. An `nginx` node would be shared by millions of
+  unrelated hosts and collapse the graph into a hub.
+- **The registrable `domains` list** on a host response, because it is just the `hostnames` with
+  their labels chopped off. The hostnames themselves become nodes.
+
+### CVEs are capped at 25 per host
+
+One ordinary unpatched Apache carries **119** CVEs; a full page of search results would be over ten
+thousand vulnerability nodes. Survivors are ranked by CVSS (`cvss_v3` → `cvss` → `cvss_v2`,
+whichever Shodan recorded) and the number dropped is stated in the run summary — a cap that does not
+say so reads as "this host has 25 CVEs", which is a different and false claim.
 
 ## Your API key
 
-Each of the three plugins declares its own `api_key` setting (Settings ➜ paste your
-`api.shodan.io` key), because Vineyard's config store is keyed per **plugin**, not per pack — there
-is no cross-plugin sharing to lean on. Paste it once per row; after that it is remembered
-(encrypted, desktop OS keychain) or held for the session (browser `sessionStorage`). The key is
-sent only as Shodan's own `?key=` query parameter — Shodan's REST API has no header-auth option —
-and never leaves this pack's own declared endpoints.
+Every plugin declares its own `api_key` setting, because Vineyard's config store is keyed per
+**plugin**. You still only paste it **once**: the app copies a value you type into any row to the
+other plugins in the same pack that declare the same key. After that it is remembered (encrypted,
+desktop OS keychain) or held for the session (browser `sessionStorage`).
 
-## Rate limits and cost
+The key is sent only as Shodan's own `?key=` query parameter — its REST API has no header-auth
+option — and never leaves this pack's declared endpoints.
 
-- `/shodan/host/search` costs **1 query credit** per call. This pack calls it exactly once per run.
-- `/dns/domain/{domain}` and `/api-info` are **free** and do not spend a credit (measured against a
-  live `dev`-plan key).
-- A `429` gets one retry (honoring `Retry-After` when Shodan sends it, else a 2s backoff); the DNS
-  plugin also paces ~350ms between sequential domain lookups in a batch.
+One scope reads wider than you might expect: **Shodan Host** declares
+`https://api.shodan.io/shodan/host`, because the IP is part of the path and the scope grammar has no
+wildcard. Matching is on segment boundaries, so that prefix also covers `/shodan/host/search` and
+`/shodan/host/count`. The install gate says so in as many words.
+
+## Rate limits
+
+- `429` gets one retry, honoring `Retry-After` when Shodan sends it, else a 2s backoff.
+- Plugins that loop over a selection pace ~350ms between sequential calls.
+- DNS Resolve and DNS Reverse batch 25 names/addresses per request, so a large selection costs a
+  handful of calls rather than one each.
 
 ## Layout
 
 - `plugins/shodan.manifest.json` — the pack manifest (catalog entry source; also what the
-  marketplace install gate reads).
-- `dist/pack.mjs` — the runnable bundle. Hand-written (no build step), matching the Telegram pack's
-  layout — the plugin manifests are duplicated here as JS object literals rather than imported from
-  the JSON, because dynamic `import()` of a JSON module needs import-attribute syntax whose support
-  is still inconsistent across engines; `test-plugin.mjs` pins the two copies against each other.
-- `test-plugin.mjs` — functional tests (mocked graph/network) plus the manifest-drift check. Run
-  with `node test-plugin.mjs`.
+  marketplace install gate reads). **Generated** — do not hand-edit.
+- `dist/pack.mjs` — the runnable bundle, and the authoritative copy of every manifest. Hand-written,
+  no build step, matching the Telegram pack's layout: the manifests are JS object literals rather
+  than an import of the JSON, because dynamic `import()` of a JSON module needs import-attribute
+  syntax whose support is still inconsistent across engines, and a `SyntaxError` there would fail
+  the whole pack rather than one plugin.
+- `gen-manifest.mjs` — pours the JS literals into the JSON. Run `node gen-manifest.mjs` after any
+  manifest edit.
+- `test-plugin.mjs` — functional tests (mocked graph/network) plus the check that the generator was
+  actually run. `node test-plugin.mjs`.
 
 Data source: `api.shodan.io`. Requires your own Shodan account and API key — get one at
 [shodan.io](https://www.shodan.io/).
