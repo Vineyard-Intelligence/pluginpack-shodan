@@ -107,6 +107,14 @@ function keyMessage(r) {
   return `Shodan request failed: ${r.error || `HTTP ${r.status}`}`;
 }
 
+/** A 401 ends the whole run, in the plugins that loop over a selection.
+ *
+ *  Those four folded every !ok into a per-item `failed` counter, so a typo'd key over a 30-node
+ *  selection read as "0 found, 30 failed" — indistinguishable from "Shodan has no data on these",
+ *  which is the wrong thing to go and investigate. A rejected key is not a per-item outcome: it
+ *  will reject the other twenty-nine too. */
+const isBadKey = (r) => r.status === 401;
+
 const NO_KEY = "No Shodan API key configured — add one in Settings below.";
 
 // ---- shared: node/edge shaping (mirrors the free packs — see file header) -------------------
@@ -128,7 +136,14 @@ const ASN_RE = /^AS(\d+)$/i;
  *  scores half the findings and mis-ranks the rest. */
 function cvssOf(detail) {
   for (const k of ["cvss_v3", "cvss", "cvss_v2"]) {
-    const n = Number(detail && detail[k]);
+    // The raw value first, and a blank one SKIPS to the next key. `Number(detail && detail[k])`
+    // reads null as 0 — finite — so a bare CVE id with no detail at all scored 0.0, which is the
+    // CVSS "None" band: the graph would assert that Log4Shell is harmless, and rank it last so the
+    // MAX_CVES cap dropped it as "lower-CVSS". Same trap one level down when a record carries
+    // cvss:null alongside a real cvss_v2.
+    const raw = detail && detail[k];
+    if (raw === null || raw === undefined || raw === "") continue;
+    const n = Number(raw);
     if (Number.isFinite(n)) return n;
   }
   return undefined;
@@ -264,18 +279,21 @@ async function writeIp(ctx, agg, asNodeByAsn, existingIpId) {
     const asn = Number(asnMatch[1]);
     let asId = asNodeByAsn.get(asn);
     if (!asId) {
+      // ASN ONLY. The typepack declares autonomous_system.country_code as "country of
+      // registration", and Shodan gives no such thing — `country` here is where THIS IP geolocates.
+      // Writing it would be wrong on its own terms and destructive besides: the AS node's identity
+      // is the ASN alone, mergeNodeData overwrites with any non-blank incoming value, and the
+      // IP-to-ASN pack fills the same field from the RIR. One Cloudflare IP in Seoul would rewrite
+      // AS13335's registered country from US to KR.
       const asNode = await ctx.graph.createNode({
         type: "infrastructure.autonomous_system",
-        data: {
-          autonomous_system_number: asn,
-          ...(country ? { country_code: country } : {}),
-        },
+        data: { autonomous_system_number: asn },
       });
       asId = String(asNode.id);
       asNodeByAsn.set(asn, asId);
+      made.as = true; // set HERE, not below: 40 IPs on one ASN are one AS node, not forty.
     }
     await ctx.graph.createEdge({ from: ipId, to: asId, label: "announced by" });
-    made.as = true;
   }
 
   // Capped, highest CVSS first. Measured: one ordinary old Apache host carries 119 CVEs, so an
@@ -299,8 +317,14 @@ async function writeIp(ctx, agg, asNodeByAsn, existingIpId) {
     made.domains++;
   }
 
-  if (loc.city || loc.country_name || Number.isFinite(loc.latitude)) {
-    const name = [loc.city, country || loc.country_name].filter(Boolean).join(", ") || loc.country_name || agg.ip;
+  // A city or a region, or no node. Falling back to the bare country produced a "US" node pinned
+  // at one host's coordinates that every US host in the run then merged into — a hub carrying no
+  // fact. The country is already on the IP node, so declining loses nothing. The city||region
+  // fallback and the label shape match the free IP Geolocation plugin exactly, so when both run
+  // they agree instead of forking the same place into two nodes.
+  const place = loc.city || loc.region_code;
+  if (place) {
+    const name = [place, country || loc.country_name].filter(Boolean).join(", ");
     const locNode = await ctx.graph.createNode({
       type: "geo.location",
       data: {
@@ -401,6 +425,7 @@ const hostPlugin = {
       if (looked > 1) await sleep(PACE_MS);
 
       const r = await shodanGet(ctx, `/shodan/host/${encodeURIComponent(ip)}`, {});
+      if (isBadKey(r)) return { summary: keyMessage(r), counts: {} };
       if (!r.ok) {
         // 404 is the routine answer for an IP Shodan has never scanned — not an error to report as
         // one, or every quiet host in a selection reads as a broken key.
@@ -668,6 +693,7 @@ const dnsDomainPlugin = {
       if (looked > 1) await sleep(PACE_MS);
 
       const r = await shodanGet(ctx, `/dns/domain/${encodeURIComponent(domain)}`, {});
+      if (isBadKey(r)) return { summary: keyMessage(r), counts: {} };
       if (!r.ok) {
         failed++;
         continue;
@@ -681,7 +707,13 @@ const dnsDomainPlugin = {
       if (subs.length > MAX_SUBDOMAINS) truncatedSubs += subs.length - MAX_SUBDOMAINS;
       for (const sub of subs.slice(0, MAX_SUBDOMAINS)) {
         if (ctx.signal && ctx.signal.aborted) break;
-        const name = sub ? `${sub}.${domain}` : domain;
+        // "*" is a wildcard RULE, not a host, and infrastructure.domain's own regex rejects the
+        // character — createNode THROWS on it, killing the run and everything staged with it.
+        // Measured against the live API: nmap.org's very first subdomain is "*". Stripping the
+        // wildcard prefix is what the free Certificate Transparency plugin does with the same
+        // input, so the two agree; a bare "*" collapses to the apex and is skipped as a duplicate.
+        const label = String(sub == null ? "" : sub).replace(/^\*\.?/, "").trim();
+        const name = label ? `${label}.${domain}` : domain;
         if (nodeByName.has(name)) continue;
         const subNode = await ctx.graph.createNode({ type: "infrastructure.domain", data: { domain_name: name } });
         await ctx.graph.createEdge({ from: ids[i], to: String(subNode.id), label: "subdomain" });
@@ -693,7 +725,8 @@ const dnsDomainPlugin = {
       if (data.length > MAX_RECORDS) truncatedRecs += data.length - MAX_RECORDS;
       for (const rec of data.slice(0, MAX_RECORDS)) {
         if (ctx.signal && ctx.signal.aborted) break;
-        const name = rec.subdomain ? `${rec.subdomain}.${domain}` : domain;
+        const recLabel = String(rec.subdomain == null ? "" : rec.subdomain).replace(/^\*\.?/, "").trim();
+        const name = recLabel ? `${recLabel}.${domain}` : domain;
         const ownerId = nodeByName.get(name) || ids[i]; // a record for a name the subdomain list omitted still anchors to the apex
         const recNode = await ctx.graph.createNode({
           type: "infrastructure.dns_record",
@@ -771,6 +804,7 @@ const dnsResolvePlugin = {
     let ips = 0;
     let unresolved = 0;
     let failed = 0;
+    let sent = 0; // requests actually made, not the batch count planned
     for (let b = 0; b < batches.length; b++) {
       if (ctx.signal && ctx.signal.aborted) break;
       ctx.progress &&
@@ -778,10 +812,14 @@ const dnsResolvePlugin = {
         ctx.progress.set({ percent: Math.round(((b + 1) / batches.length) * 100), message: `Resolving ${batches[b].length} name(s)` });
       if (b > 0) await sleep(PACE_MS);
       const r = await shodanGet(ctx, "/dns/resolve", { hostnames: batches[b].join(",") });
+      if (isBadKey(r)) return { summary: keyMessage(r), counts: {} };
       if (!r.ok) {
-        failed += batches[b].length;
+        // A cancel is not the API failing — reporting it as one sends the analyst looking for a
+        // network problem they caused themselves by clicking stop.
+        if (r.error !== "cancelled") failed += batches[b].length;
         continue;
       }
+      sent++;
       const body = r.body || {};
       for (const name of batches[b]) {
         const ip = body[name];
@@ -800,7 +838,7 @@ const dnsResolvePlugin = {
     }
     const notes = [unresolved ? `${unresolved} did not resolve` : "", failed ? `${failed} failed` : ""].filter(Boolean);
     return {
-      summary: `${ips} IP(s) from ${names.length} name(s) in ${batches.length} request(s)${notes.length ? ` (${notes.join("; ")})` : ""}`,
+      summary: `${ips} IP(s) from ${names.length} name(s) in ${sent} request(s)${notes.length ? ` (${notes.join("; ")})` : ""}`,
       counts: { ips, unresolved, failed },
     };
   },
@@ -856,6 +894,7 @@ const dnsReversePlugin = {
     let domains = 0;
     let none = 0;
     let failed = 0;
+    let sent = 0; // requests actually made, not the batch count planned
     for (let b = 0; b < batches.length; b++) {
       if (ctx.signal && ctx.signal.aborted) break;
       ctx.progress &&
@@ -863,10 +902,12 @@ const dnsReversePlugin = {
         ctx.progress.set({ percent: Math.round(((b + 1) / batches.length) * 100), message: `Reversing ${batches[b].length} address(es)` });
       if (b > 0) await sleep(PACE_MS);
       const r = await shodanGet(ctx, "/dns/reverse", { ips: batches[b].join(",") });
+      if (isBadKey(r)) return { summary: keyMessage(r), counts: {} };
       if (!r.ok) {
-        failed += batches[b].length;
+        if (r.error !== "cancelled") failed += batches[b].length;
         continue;
       }
+      sent++;
       const body = r.body || {};
       for (const ip of batches[b]) {
         const names = body[ip];
@@ -891,7 +932,7 @@ const dnsReversePlugin = {
     }
     const notes = [none ? `${none} had no PTR` : "", failed ? `${failed} failed` : ""].filter(Boolean);
     return {
-      summary: `${domains} hostname(s) from ${addrs.length} address(es) in ${batches.length} request(s)${notes.length ? ` (${notes.join("; ")})` : ""}`,
+      summary: `${domains} hostname(s) from ${addrs.length} address(es) in ${sent} request(s)${notes.length ? ` (${notes.join("; ")})` : ""}`,
       counts: { domains, no_ptr: none, failed },
     };
   },

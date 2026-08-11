@@ -156,10 +156,31 @@ const KEY = { api_key: "k" };
   check("host: a selected non-IP node triggers no request", net.calls.length === 0 && graph.createdNodes.length === 0);
 }
 {
-  const net = makeNet(() => ({ status: 401, html: "<html>401 Unauthorized</html>" }));
-  const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "1.2.3.4" } } });
-  const r = await hostPlugin.run({ config: KEY, input: { selection: ["ip1"] }, net, graph, ...RUN });
-  check("host: a 401 with an HTML body does not throw", r.counts.failed === 1);
+  // A rejected key must SAY it was rejected. Folding it into a per-item "failed" counter made a
+  // typo'd key indistinguishable from "Shodan has no data on these", over the whole selection.
+  const nodes = {};
+  const selection = [];
+  for (let i = 0; i < 4; i++) {
+    nodes[`ip${i}`] = { id: `ip${i}`, type: "infrastructure.ip_address", data: { ip_address: `1.2.3.${i}` } };
+    selection.push(`ip${i}`);
+  }
+  for (const [name, plugin, sel] of [
+    ["host", hostPlugin, selection],
+    ["dns_reverse", dnsReversePlugin, selection],
+  ]) {
+    const net = makeNet(() => ({ status: 401, html: "<html>401 Unauthorized</html>" }));
+    const r = await plugin.run({ config: KEY, input: { selection: sel }, net, graph: makeGraph(nodes), ...RUN });
+    check(`${name}: a 401 with an HTML body does not throw`, typeof r.summary === "string");
+    check(`${name}: a rejected key says so instead of counting 4 mystery failures`, /rejected this key/.test(r.summary));
+    check(`${name}: a rejected key stops the run instead of retrying every selected node`, net.calls.length === 1);
+  }
+  const dnodes = { d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "a.test" } }, d2: { id: "d2", type: "infrastructure.domain", data: { domain_name: "b.test" } } };
+  for (const [name, plugin] of [["dns_domain", dnsDomainPlugin], ["dns_resolve", dnsResolvePlugin]]) {
+    const net = makeNet(() => ({ status: 401, html: "<html>401</html>" }));
+    const r = await plugin.run({ config: KEY, input: { selection: ["d1", "d2"] }, net, graph: makeGraph(dnodes), ...RUN });
+    check(`${name}: a rejected key says so`, /rejected this key/.test(r.summary));
+    check(`${name}: a rejected key stops the run`, net.calls.length === 1);
+  }
 }
 
 {
@@ -180,6 +201,69 @@ const KEY = { api_key: "k" };
   check("host: cvss_v2 is read as a fallback", vulns[1].data.cvss_score === 3.9);
   check("host: what the cap dropped is reported, not silently vanished", /16 lower-CVSS CVE\(s\) omitted/.test(r.summary));
   check("host: a score found in a service detail is not lost to the bare top-level id list", vulns.every((n) => n.data.cvss_score !== undefined));
+}
+
+{
+  // Every defect the adversarial review confirmed, pinned as the input that produced it.
+  const net = makeNet(() => ({
+    status: 200,
+    body: {
+      ip_str: "1.2.3.4",
+      ports: [443],
+      // The measured flat-ARRAY spelling: bare ids, NO detail object anywhere.
+      vulns: ["CVE-2021-44228"],
+      asn: "AS13335",
+      country_code: "KR",
+      country_name: "South Korea",
+      latitude: 37.5,
+      longitude: 127,
+      data: [{ port: 443 }],
+    },
+  }));
+  const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "1.2.3.4" } } });
+  await hostPlugin.run({ config: KEY, input: { selection: ["ip1"] }, net, graph, ...RUN });
+
+  const v = graph.createdNodes.find((n) => n.type === "threat.vulnerability");
+  // Number(null) is 0 and 0 is FINITE, so a bare id used to score 0.0 — the CVSS "None" band. The
+  // graph would have asserted that Log4Shell is harmless, and ranked it last for the MAX_CVES cap.
+  check("cvss: a bare CVE id with no detail carries NO score, rather than 0", v && !("cvss_score" in v.data));
+  const as = graph.createdNodes.find((n) => n.type === "infrastructure.autonomous_system");
+  // autonomous_system.country_code is declared "country of registration"; Shodan gives the country
+  // THIS IP geolocates in. The AS node's identity is the ASN alone, so writing it would let one
+  // Cloudflare IP in Seoul rewrite AS13335's registered country for every pack that reads it.
+  check("as: the IP's geolocated country is NOT stamped on the shared AS node", as && !("country_code" in as.data));
+  // No city and no region: the label would fall back to a bare "KR", a country-sized hub pinned at
+  // one host's coordinates that every KR host in the run then merges into.
+  check("geo: no location node when there is no city or region to name it", !graph.createdNodes.some((n) => n.type === "geo.location"));
+}
+{
+  // One ASN across many IPs is ONE node, and the summary must count nodes, not IPs.
+  const matches = [
+    { ip_str: "1.1.1.1", port: 80, asn: "AS13335" },
+    { ip_str: "1.0.0.1", port: 80, asn: "AS13335" },
+  ];
+  const net = makeNet(() => ({ status: 200, body: { matches, total: 2 } }));
+  const graph = makeGraph({});
+  const r = await searchPlugin.run({ config: KEY, params: { query: "q" }, input: { selection: [] }, net, graph, ...RUN });
+  check("as: two IPs on one ASN produce ONE AS node", graph.createdNodes.filter((n) => n.type === "infrastructure.autonomous_system").length === 1);
+  check("as: ...and the summary says 1 AS, not 2", r.counts.autonomous_systems === 1);
+  check("as: both IPs still edge to it", graph.createdEdges.filter((e) => e.label === "announced by").length === 2);
+}
+{
+  // Measured live: nmap.org's FIRST subdomain from /dns/domain is "*". infrastructure.domain's
+  // regex has no "*", so createNode THROWS on it and takes the whole run down with everything
+  // already staged. The free CT-log plugin strips the wildcard prefix; match it.
+  const net = makeNet(() => ({
+    status: 200,
+    body: { subdomains: ["*", "www"], data: [{ subdomain: "*", type: "A", value: "1.2.3.4" }] },
+  }));
+  const graph = makeGraph({ d1: { id: "d1", type: "infrastructure.domain", data: { domain_name: "nmap.org" } } });
+  await dnsDomainPlugin.run({ config: KEY, input: { selection: ["d1"] }, net, graph, ...RUN });
+  const names = graph.createdNodes.filter((n) => n.type === "infrastructure.domain").map((n) => n.data.domain_name);
+  check('dns_domain: a "*" wildcard never becomes a domain node', !names.some((n) => n.includes("*")));
+  check("dns_domain: it collapses to the apex and is skipped, leaving the real subdomain", names.join() === "www.nmap.org");
+  const rec = graph.createdNodes.find((n) => n.type === "infrastructure.dns_record");
+  check("dns_domain: a wildcard record anchors to the apex under the apex's own name", rec.data.record_name === "nmap.org");
 }
 
 // ================================================================ shodan_search
