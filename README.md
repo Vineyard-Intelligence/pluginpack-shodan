@@ -5,8 +5,7 @@ key — nothing here is keyless. For free, keyless IP enrichment (including Shod
 InternetDB endpoint), see the **IP Recon** pack instead.
 
 One plugin per endpoint, so you pick the cheapest call that answers the question instead of
-reaching for search every time. **Only Shodan Search spends a query credit.** Every cost below is
-measured against a live `dev` key by reading `/api-info` before and after — not read off the docs.
+reaching for search every time. **Only Shodan Search spends a query credit.**
 
 | Plugin | Endpoint | Cost | Takes | Gives |
 | --- | --- | --- | --- | --- |
@@ -23,9 +22,7 @@ The intended loop: **Count** to see whether a query is worth a credit → **Sear
 
 ## Node/edge shapes match the free packs already shipped
 
-Rather than invent a parallel model for the same facts, this pack reuses the exact node types and
-edge labels the free packs already established, so a CVE or an AS number reads the same on the
-canvas whichever plugin put it there:
+A CVE or an AS number reads the same on the canvas whichever plugin put it there:
 
 | Fact | Node type | Edge label | Matches |
 | --- | --- | --- | --- |
@@ -42,32 +39,27 @@ canvas whichever plugin put it there:
 
 - **Product and version** (`Apache httpd 2.4.7`, `OpenSSH 6.6.1p1`) and **Shodan tags** (`cloud`,
   `honeypot`) are reported in the run summary instead. They are pivot *queries* — you read them and
-  feed them back into Shodan Search — not entities. An `nginx` node would be shared by millions of
-  unrelated hosts and collapse the graph into a hub.
+  feed them back into Shodan Search — not entities; an `nginx` node would become a hub shared by
+  millions of unrelated hosts.
 - **The registrable `domains` list** on a host response, because it is just the `hostnames` with
   their labels chopped off. The hostnames themselves become nodes.
 
 ### CVEs are capped at 25 per host
 
-One ordinary unpatched Apache carries **119** CVEs; a full page of search results would be over ten
-thousand vulnerability nodes. Survivors are ranked by CVSS (`cvss_v3` → `cvss` → `cvss_v2`,
-whichever Shodan recorded) and the number dropped is stated in the run summary — a cap that does not
-say so reads as "this host has 25 CVEs", which is a different and false claim.
+Survivors are ranked by CVSS (`cvss_v3` → `cvss` → `cvss_v2`, whichever Shodan recorded) and the
+number dropped is stated in the run summary.
 
 ## Your API key
 
-Every plugin declares its own `api_key` setting, because Vineyard's config store is keyed per
-**plugin**. You still only paste it **once**: the app copies a value you type into any row to the
-other plugins in the same pack that declare the same key. After that it is remembered (encrypted,
-desktop OS keychain) or held for the session (browser `sessionStorage`).
+Every plugin declares its own `api_key` setting, but you only paste it **once**: the app copies a
+value you type into any row to the other plugins in the same pack that declare the same key. After
+that it is remembered (encrypted, desktop OS keychain) or held for the session (browser
+`sessionStorage`).
 
-The key is sent only as Shodan's own `?key=` query parameter — its REST API has no header-auth
-option — and never leaves this pack's declared endpoints.
+The key is sent only as Shodan's own `?key=` query parameter.
 
-One scope reads wider than you might expect: **Shodan Host** declares
-`https://api.shodan.io/shodan/host`, because the IP is part of the path and the scope grammar has no
-wildcard. Matching is on segment boundaries, so that prefix also covers `/shodan/host/search` and
-`/shodan/host/count`. The install gate says so in as many words.
+At install, **Shodan Host**'s network permission (`https://api.shodan.io/shodan/host`) also covers
+`/shodan/host/search` and `/shodan/host/count`.
 
 ## Rate limits
 
@@ -80,11 +72,8 @@ wildcard. Matching is on segment boundaries, so that prefix also covers `/shodan
 
 - `plugins/shodan.manifest.json` — the pack manifest (catalog entry source; also what the
   marketplace install gate reads). **Generated** — do not hand-edit.
-- `dist/pack.mjs` — the runnable bundle, and the authoritative copy of every manifest. Hand-written,
-  no build step, matching the Telegram pack's layout: the manifests are JS object literals rather
-  than an import of the JSON, because dynamic `import()` of a JSON module needs import-attribute
-  syntax whose support is still inconsistent across engines, and a `SyntaxError` there would fail
-  the whole pack rather than one plugin.
+- `dist/pack.mjs` — the runnable bundle, and the authoritative copy of every manifest (as JS object
+  literals). Hand-written, no build step.
 - `gen-manifest.mjs` — pours the JS literals into the JSON. Run `node gen-manifest.mjs` after any
   manifest edit.
 - `test-plugin.mjs` — functional tests (mocked graph/network) plus the check that the generator was
