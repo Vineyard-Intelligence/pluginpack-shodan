@@ -364,7 +364,7 @@ const hostPlugin = {
     identifier: "run.vineyard.plugins.shodan_host",
     content_type: "vineyard:plugin",
     name: "Shodan Host",
-    version: "2.0.1",
+    version: "2.0.2",
     description:
       "Looks up each selected IP Address in Shodan and creates its Host with open ports (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP, highest CVSS first), reverse hostnames as Domain nodes (\"resolves to\"), its Autonomous System (\"announced by\") and Location (\"geolocated to\"); fills the IP's country_code, organization, asn and reverse_dns. Product/version banners and Shodan tags are listed in the run summary, not added as nodes. Does not spend a query credit; needs a Shodan API key.",
     icon: "server",
@@ -389,10 +389,8 @@ const hostPlugin = {
           methods: ["GET"],
           // The IP is a PATH parameter, and the scope grammar has no wildcard — the narrowest
           // expressible scope is this prefix, which by segment-boundary matching also covers
-          // /shodan/host/search and /shodan/host/count. Said plainly here because this string is
-          // what the analyst reads at the install gate, and that screen has to be the truth.
-          purpose:
-            "Fetch everything Shodan knows about one IP address. The IP is part of the path, so this scope necessarily covers everything under /shodan/host/ — including the search and count endpoints.",
+          // /shodan/host/search and /shodan/host/count. The install gate shows this endpoint.
+          purpose: "Look up each selected IP address's host details on Shodan.",
         },
       ],
       config: KEY_CONFIG,
@@ -479,9 +477,9 @@ const searchPlugin = {
     identifier: "run.vineyard.plugins.shodan_search",
     content_type: "vineyard:plugin",
     name: "Shodan Search",
-    version: "2.0.1",
+    version: "2.0.2",
     description:
-      "Runs a Shodan host search from a query in the Run dialog (no selection) and creates up to 100 matching IP Address nodes per page, each with its Host (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP), hostnames as Domain nodes (\"resolves to\"), Autonomous System (\"announced by\") and Location (\"geolocated to\"). Spends 1 query credit per page; needs a Shodan API key.",
+      "Runs a Shodan host search from a query in the Run dialog (no selection) and creates up to 100 matching IP Address nodes per page, each with its Host (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP), hostnames as Domain nodes (\"resolves to\"), Autonomous System (\"announced by\") and Location (\"geolocated to\"). Spends 1 query credit when the query uses a filter or for any page after the first; needs a Shodan API key.",
     icon: "search",
     author: AUTHOR,
     license: "Apache-2.0",
@@ -493,15 +491,14 @@ const searchPlugin = {
           type: "string",
           title: "Query",
           minLength: 1,
-          description:
-            'Shodan search syntax. Examples: org:"Example Corp" · hostname:example.com · product:nginx port:443 · ssl.cert.subject.cn:example.com',
+          description: 'Shodan search query, e.g. org:"Example Corp", hostname:example.com or product:nginx port:443.',
         },
         page: {
           type: "integer",
           title: "Page",
           minimum: 1,
           default: 1,
-          description: "100 results per page. Each page is a separate query credit.",
+          description: "Results page to fetch, 100 results per page (default 1). Each page is a separate search and can spend a query credit.",
         },
       },
       required: ["query"],
@@ -523,7 +520,7 @@ const searchPlugin = {
         {
           endpoint: "https://api.shodan.io/shodan/host/search",
           methods: ["GET"],
-          purpose: "Run the query against Shodan's host search index.",
+          purpose: "Search Shodan for hosts matching the query.",
         },
       ],
       config: KEY_CONFIG,
@@ -577,7 +574,7 @@ const countPlugin = {
     identifier: "run.vineyard.plugins.shodan_count",
     content_type: "vineyard:plugin",
     name: "Shodan Count",
-    version: "2.0.1",
+    version: "2.0.2",
     description:
       "Counts the hosts matching a Shodan search query from the Run dialog (no selection) and reports the total and facet breakdowns (default: country, org, port, product) in the run summary; creates no nodes. Does not spend a query credit; needs a Shodan API key.",
     icon: "chart-bar",
@@ -591,13 +588,13 @@ const countPlugin = {
           type: "string",
           title: "Query",
           minLength: 1,
-          description: 'Same syntax as Shodan Search, e.g. org:"Example Corp" · product:nginx country:KR',
+          description: 'Shodan search query, e.g. org:"Example Corp" or product:nginx country:KR.',
         },
         facets: {
           type: "string",
           title: "Facets",
           default: "country:5,org:5,port:5,product:5",
-          description: "Comma-separated facet:count pairs. Blank for the total only.",
+          description: "Comma-separated facet:count pairs; country:5,org:5,port:5,product:5 if not given. An empty string returns the total only.",
         },
       },
       required: ["query"],
@@ -608,7 +605,7 @@ const countPlugin = {
         {
           endpoint: "https://api.shodan.io/shodan/host/count",
           methods: ["GET"],
-          purpose: "Count the hosts matching a query, without spending a credit.",
+          purpose: "Count the hosts matching a query on Shodan.",
         },
       ],
       config: KEY_CONFIG,
@@ -994,7 +991,7 @@ export default {
     identifier: "run.vineyard.pluginpacks.shodan",
     content_type: "vineyard:pluginpack",
     name: "Shodan",
-    version: "2.0.1",
+    version: "2.0.2",
     description:
       "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
     author: AUTHOR,
