@@ -2,7 +2,7 @@
   "identifier": "run.vineyard.pluginpacks.shodan",
   "content_type": "vineyard:pluginpack",
   "name": "Shodan",
-  "version": "2.0.3",
+  "version": "2.1.0",
   "description": "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
   "author": {
     "name": "VINEYARD",
@@ -22,8 +22,8 @@
       "identifier": "run.vineyard.plugins.shodan_host",
       "content_type": "vineyard:plugin",
       "name": "Shodan Host",
-      "version": "2.0.2",
-      "description": "Looks up each selected IP Address in Shodan and creates its Host with open ports (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP, highest CVSS first), reverse hostnames as Domain nodes (\"resolves to\"), its Autonomous System (\"announced by\") and Location (\"geolocated to\"); fills the IP's country_code, organization, asn and reverse_dns. Product/version banners and Shodan tags are listed in the run summary, not added as nodes. Does not spend a query credit; needs a Shodan API key.",
+      "version": "2.1.0",
+      "description": "Looks up each selected IP Address in Shodan and creates its Host with open ports (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP, highest CVSS first), reverse hostnames as Domain nodes (\"resolves to\"), its Autonomous System (\"announced by\"), Location (\"geolocated to\"), and what its services present: TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"). Fills the IP's country_code, organization, asn and reverse_dns, plus shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm. Does not spend a query credit; needs a Shodan API key.",
       "icon": "server",
       "author": {
         "name": "VINEYARD",
@@ -70,6 +70,21 @@
             "typepack": "run.vineyard.typepacks.geo",
             "category": "geo",
             "name": "location"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "certificate"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "web",
+            "name": "favicon_hash"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "ssh_host_key"
           }
         ]
       },
@@ -112,8 +127,8 @@
       "identifier": "run.vineyard.plugins.shodan_search",
       "content_type": "vineyard:plugin",
       "name": "Shodan Search",
-      "version": "2.0.2",
-      "description": "Runs a Shodan host search from a query in the Run dialog (no selection) and creates up to 100 matching IP Address nodes per page, each with its Host (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP), hostnames as Domain nodes (\"resolves to\"), Autonomous System (\"announced by\") and Location (\"geolocated to\"). Spends 1 query credit when the query uses a filter or for any page after the first; needs a Shodan API key.",
+      "version": "2.1.0",
+      "description": "Runs a Shodan host search from a query in the Run dialog (no selection) and creates up to 100 matching IP Address nodes per page, each with its Host (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP), hostnames as Domain nodes (\"resolves to\"), Autonomous System (\"announced by\"), Location (\"geolocated to\"), TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"), with shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm on the IP. Spends 1 query credit when the query uses a filter or for any page after the first; needs a Shodan API key.",
       "icon": "search",
       "author": {
         "name": "VINEYARD",
@@ -180,6 +195,21 @@
             "typepack": "run.vineyard.typepacks.geo",
             "category": "geo",
             "name": "location"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "certificate"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "web",
+            "name": "favicon_hash"
+          },
+          {
+            "typepack": "run.vineyard.typepacks.infrastructure",
+            "category": "infrastructure",
+            "name": "ssh_host_key"
           }
         ]
       },

@@ -326,6 +326,120 @@ const KEY = { api_key: "k" };
   check("search: refuses with no query", /Enter a Shodan search query/.test(r.summary));
 }
 
+// ================================================================ fingerprints a service presents
+// Field shapes from Shodan's banner schema and Datapedia samples (datapedia.shodan.io, 2026-10): the
+// ssl.cert serial is a JSON number (the sample's is 1.908545518767334e+38), validity is ASN.1 time,
+// ssh.key is base64 wrapped at 76 columns, ssh.fingerprint is MD5. The SHA-256 below was computed
+// with `ssh-keygen -lf` from that same sample key (SHA256:ROQFvPThGrW4RuWLoL9tq9I9zJ42fK4XywyRtbOz/EQ).
+const SAMPLE_SSH_KEY =
+  "AAAAB3NzaC1yc2EAAAADAQABAAABAQCsj2bNKTBSpIYDEGk9KxsGh3mySTRgMtXL583qmBpzeQ+j\nqCMRgBqB98u3z++J1sKlXHWfM9dyhSevkMwSbhoR8XIq/U0tCNyokEi/ueaBMCvbcTHhO7FcwzY9\n2WK4Yt0aGROY5qX2UKSeOvuP4D6TPqKF1onrSzH9bx9XUf2lEdWT/ia1NEKjunUqu1xOB/StKDHM\noX4/OKyIzuS0q/T1zOATthvasJFoPrAjkohTyaDUz2LN5JoH839hViyEG82yB+MjcFV5MU3N1l1Q\nL3cVUCh93xSaua1N85qivl+siMkPGbO5xR/En4iEY6K2XPASUEMaieWVNTRCtJ4S8H+9\n";
+const SAMPLE_SSH_SHA256 = "44e405bcf4e11ab5b846e58ba0bf6dabd23dcc9e367cae17cb0c91b5b3b3fc44";
+const GITLAB_CERT = {
+  sig_alg: "sha256WithRSAEncryption",
+  issued: "20171123000000Z",
+  expires: "20190121235959Z",
+  version: 2,
+  fingerprint: { sha256: "0B1E768B492663D9D236C40DE17BE1A379A2E3146C2AA8890E613FB3095A0D92", sha1: "e19d2258e5f9f5aa35e4c9be2f60c0a34c08492e" },
+  serial: 1.908545518767334e38,
+  issuer: { C: "GB", ST: "Greater Manchester", CN: "COMODO RSA Domain Validation Secure Server CA", O: "COMODO CA Limited", L: "Salford" },
+  subject: { OU: "PositiveSSL", CN: "gitlab.com" },
+  extensions: [{ data: "0\\x1c\\x82\\ngitlab.com\\x82\\x0ewww.gitlab.com", name: "subjectAltName" }],
+};
+const DEVICE_CERT = {
+  issued: "20200101000000Z",
+  expires: "20300101000000Z",
+  fingerprint: { sha256: "c".repeat(64) },
+  serial: 4660,
+  issuer: { CN: "FortiGate" },
+  subject: { CN: "FortiGate" },
+};
+{
+  const body = {
+    ip_str: "198.51.100.7",
+    ports: [22, 443, 2222, 8443],
+    tags: ["cloud", "self-signed"],
+    data: [
+      { port: 22, product: "OpenSSH", version: "6.6.1p1", ssh: { fingerprint: "b6:03:0e:39:97:9e:d0:e7:24:ce:a3:77:3e:01:42:09", key: SAMPLE_SSH_KEY, type: "ssh-rsa" } },
+      { port: 2222, ssh: { key: "not a key blob!", fingerprint: "00:11" } },
+      {
+        port: 443,
+        product: "nginx",
+        ssl: { cert: GITLAB_CERT, jarm: "29D29D00029D29D00041D41D00041D2AA5CE6A70DE7BA95AEF77A77B00A0AF" },
+        http: { title: " The only single product for the complete DevOps lifecycle - GitLab | GitLab ", favicon: { hash: 516963061, location: "https://about.gitlab.com:443/ico/favicon.ico" } },
+      },
+      { port: 8443, ssl: { cert: DEVICE_CERT, jarm: "00000000000000000000000000000000000000000000000000000000000000" }, http: { favicon: { hash: -235701012 } } },
+      { port: 8444, ssl: { cert: GITLAB_CERT } }, // the same certificate on a second port
+      { port: 9000 }, // a service with none of these fields
+    ],
+  };
+  const net = makeNet(() => ({ status: 200, body }));
+  const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "198.51.100.7" } } });
+  const r = await hostPlugin.run({ config: KEY, input: { selection: ["ip1"] }, net, graph, ...RUN });
+  const of = (t) => graph.createdNodes.filter((n) => n.type === t);
+  const edgesTo = (label) => graph.createdEdges.filter((e) => e.label === label && e.from === "ip1");
+
+  const certs = of("infrastructure.certificate");
+  const gitlab = certs.find((n) => n.data.subject_common_name === "gitlab.com");
+  const device = certs.find((n) => n.data.subject_common_name === "FortiGate");
+  check("fp: one certificate node per distinct fingerprint, not per port", certs.length === 2);
+  check("fp: certificate identity is the lowercased SHA-256", gitlab && gitlab.data.fingerprint_sha256 === GITLAB_CERT.fingerprint.sha256.toLowerCase());
+  check("fp: issuer reads 'O — CN', as VirusTotal writes it", gitlab && gitlab.data.issuer === "COMODO CA Limited — COMODO RSA Domain Validation Secure Server CA");
+  check("fp: ASN.1 validity becomes ISO datetimes", gitlab && gitlab.data.not_before === "2017-11-23T00:00:00Z" && gitlab.data.not_after === "2019-01-21T23:59:59Z");
+  // A 128-bit serial arrives as a rounded float; written, it would clobber the exact one VT/Censys wrote.
+  check("fp: a serial that lost precision in JSON is left out, not rounded", gitlab && !("serial_number" in gitlab.data));
+  check("fp: a serial that survived parsing is written in hex", device && device.data.serial_number === "1234");
+  check("fp: IP -> certificate edges labelled like Censys Host Lookup", edgesTo("presents certificate").length === 2);
+
+  const favs = of("web.favicon_hash");
+  check("fp: favicon hashes keep Shodan's signed MMH3 as Web Recon writes it", favs.map((n) => n.data.hash_value).sort().join() === "-235701012,516963061" && favs.every((n) => n.data.hash_algorithm === "mmh3"));
+  check("fp: IP -> favicon edges labelled like Web Recon", edgesTo("has favicon").length === 2);
+
+  const keys = of("infrastructure.ssh_host_key");
+  check("fp: SSH host key is SHA-256 of the decoded blob (ssh-keygen's value), not the MD5 fingerprint", keys.length === 1 && keys[0].data.fingerprint_sha256 === SAMPLE_SSH_SHA256);
+  check("fp: key type read from the blob", keys[0] && keys[0].data.key_type === "ssh-rsa");
+  check("fp: a value that is not a key blob is skipped", !graph.createdNodes.some((n) => /:/.test(String(n.data.fingerprint_sha256 || ""))));
+  check("fp: IP -> host key edge labelled like Censys Host Lookup", edgesTo("presents host key").length === 1);
+
+  const upd = (graph.updates[0] || {}).data || {};
+  check("fp: Shodan tags written onto the IP", upd.shodan_tags === "cloud, self-signed");
+  check("fp: products written per port", upd.shodan_products === "22: OpenSSH 6.6.1p1; 443: nginx");
+  check("fp: HTTP title written per port, trimmed", upd.shodan_http_title === "443: The only single product for the complete DevOps lifecycle - GitLab | GitLab");
+  check("fp: JARM written per port, and an all-zero JARM (no handshake) is not", upd.shodan_jarm === "443: 29d29d00029d29d00041d41d00041d2aa5ce6a70de7ba95aef77a77b00a0af");
+  check("fp: no JARM, tag or product node", !graph.createdNodes.some((n) => /jarm|tag|technolog/.test(n.type)));
+  check("fp: summary and counts name what was presented", /2 certificate\(s\), 2 favicon hash\(es\), 1 SSH host key\(s\)/.test(r.summary) && r.counts.certificates === 2 && r.counts.ssh_host_keys === 1);
+}
+{
+  // Search: one row per service, the same certificate on two IPs. Each IP gets its own edge to it;
+  // the host merges the two createNode calls into one node by fingerprint.
+  const matches = [
+    { ip_str: "203.0.113.1", port: 443, tags: ["cdn"], ssl: { cert: GITLAB_CERT, jarm: "2ad2ad0002ad2ad22c42d42d000000faabb8fd156aa8b4d8a37853e1063261" }, http: { title: "Panel", favicon: { hash: 81586312 } } },
+    { ip_str: "203.0.113.1", port: 22, ssh: { key: SAMPLE_SSH_KEY } },
+    { ip_str: "203.0.113.2", port: 8443, ssl: { cert: GITLAB_CERT } },
+  ];
+  const net = makeNet(() => ({ status: 200, body: { matches, total: 3 } }));
+  const graph = makeGraph({});
+  const r = await searchPlugin.run({ config: KEY, params: { query: "ssl.cert.fingerprint:x" }, input: { selection: [] }, net, graph, ...RUN });
+  const ips = graph.createdNodes.filter((n) => n.type === "infrastructure.ip_address");
+  const ip1 = ips.find((n) => n.data.ip_address === "203.0.113.1");
+  const ip2 = ips.find((n) => n.data.ip_address === "203.0.113.2");
+  const certIds = new Set(graph.createdNodes.filter((n) => n.type === "infrastructure.certificate" && n.data.fingerprint_sha256 === GITLAB_CERT.fingerprint.sha256.toLowerCase()).map((n) => n.id));
+  const certEdges = graph.createdEdges.filter((e) => e.label === "presents certificate" && certIds.has(e.to));
+  check("search fp: both IPs present the shared certificate", ip1 && ip2 && certEdges.some((e) => e.from === ip1.id) && certEdges.some((e) => e.from === ip2.id));
+  check("search fp: rows of one IP aggregate their favicon and SSH key onto it", graph.createdEdges.some((e) => e.from === ip1?.id && e.label === "has favicon") && graph.createdEdges.some((e) => e.from === ip1?.id && e.label === "presents host key"));
+  check("search fp: tags, title and JARM ride on the created IP (search has no node:update)", ip1 && ip1.data.shodan_tags === "cdn" && ip1.data.shodan_http_title === "443: Panel" && /^443: 2ad2ad/.test(ip1.data.shodan_jarm));
+  check("search fp: an IP with no such fields gets no empty shodan_* keys", ip2 && !Object.keys(ip2.data).some((k) => k.startsWith("shodan_")));
+  check("search fp: counts name what was presented", r.counts.certificates === 2 && r.counts.favicon_hashes === 1 && r.counts.ssh_host_keys === 1);
+}
+{
+  // A host answering on every port: the per-port properties are capped and say how many were left out.
+  const data = Array.from({ length: 30 }, (_, i) => ({ port: 1000 + i, product: "tcpwrapped" }));
+  const net = makeNet(() => ({ status: 200, body: { ip_str: "192.0.2.9", ports: data.map((d) => d.port), data } }));
+  const graph = makeGraph({ ip1: { id: "ip1", type: "infrastructure.ip_address", data: { ip_address: "192.0.2.9" } } });
+  await hostPlugin.run({ config: KEY, input: { selection: ["ip1"] }, net, graph, ...RUN });
+  const products = (graph.updates[0] || {}).data?.shodan_products || "";
+  check("fp: per-port properties are capped at 25 entries, the rest counted", products.split("; ").length === 25 && / \(\+5 more\)$/.test(products));
+}
+
 // ================================================================ shodan_count
 {
   const net = makeNet((url) => {

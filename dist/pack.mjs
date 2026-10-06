@@ -32,9 +32,16 @@
 // an AS number reads the same whichever plugin put it on the canvas.
 //
 // WHAT IS DELIBERATELY *NOT* A NODE: Shodan's per-service `product`/`version` (Apache httpd 2.4.7,
-// OpenSSH 6.6.1) and its `tags` (cloud, honeypot). Those are pivot *queries*, not entities — a
-// "nginx" node would collide across millions of unrelated hosts and collapse the graph into a hub.
-// They go in the run summary instead, where they are read and fed back into shodan_search.
+// OpenSSH 6.6.1), its `tags` (cloud, honeypot), the HTTP title and the JARM. Those are pivot
+// *queries*, not entities — a "nginx" node would collide across millions of unrelated hosts and
+// collapse the graph into a hub, and a JARM names a TLS stack, not an operator. They are written
+// onto the IP as shodan_* properties (and the products and tags listed in the run summary), where
+// they are read and fed back into shodan_search.
+//
+// WHAT IS A NODE: the fingerprints a service presents — its TLS certificate, its favicon hash and
+// its SSH host key. Each is identified by its own hash, the same value Censys, VirusTotal and Web
+// Recon write, so the same certificate seen anywhere is one node and the IPs presenting it meet
+// there.
 
 const API = "https://api.shodan.io";
 
@@ -44,6 +51,7 @@ const RESOLVE_BATCH = 25;
 const MAX_SUBDOMAINS = 150; // matches the free Certificate Transparency plugin's per-domain cap
 const MAX_RECORDS = 300;
 const MAX_CVES = 25; // per IP — see the note in writeIp
+const MAX_LISTED = 25; // per-port entries in one shodan_* property (some hosts answer on every port)
 const PACE_MS = 350; // courteous spacing between sequential calls in a batch
 
 // ---- shared: key, fetch, pacing ------------------------------------------------------------
@@ -166,6 +174,73 @@ function collectVulns(vulns, into) {
   }
 }
 
+const hex64 = (v) => (typeof v === "string" && /^[0-9a-f]{64}$/i.test(v.trim()) ? v.trim().toLowerCase() : "");
+
+/** Shodan stamps certificate validity as ASN.1 time (`20171123000000Z`); the typepack declares datetime. */
+function certTime(v) {
+  const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z$/.exec(String(v || ""));
+  return m ? `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z` : undefined;
+}
+
+/** The serial in hex, as VirusTotal and Censys write it — or nothing. Shodan sends the serial as a
+ *  JSON NUMBER, so a 128-bit one has already lost its low digits when the body is parsed (Shodan's
+ *  own sample: 1.908545518767334e+38). mergeNodeData keeps the latest non-blank value, so a rounded
+ *  serial would overwrite the exact one another pack wrote on the same certificate node. Only a
+ *  serial that survived parsing intact is kept. */
+function serialHex(v) {
+  if (Number.isSafeInteger(v) && v >= 0) return v.toString(16);
+  return typeof v === "string" && /^\d+$/.test(v) ? BigInt(v).toString(16) : undefined;
+}
+
+/** The leaf certificate a service presented, as typepack properties — shaped like VirusTotal's
+ *  (issuer as "O — CN"), which reads Shodan's subject/issuer dictionaries the same way. */
+function certOf(svc) {
+  const c = svc && svc.ssl && svc.ssl.cert;
+  const fp = hex64(c && c.fingerprint && c.fingerprint.sha256);
+  if (!fp) return null;
+  const str = (x) => (typeof x === "string" && x ? x : undefined);
+  const cn = str(c.subject && c.subject.CN);
+  const issuer = [c.issuer && c.issuer.O, c.issuer && c.issuer.CN].filter(str).join(" — ");
+  const serial = serialHex(c.serial);
+  const nb = certTime(c.issued);
+  const na = certTime(c.expires);
+  return {
+    fingerprint_sha256: fp,
+    ...(cn ? { subject_common_name: cn } : {}),
+    ...(issuer ? { issuer } : {}),
+    ...(serial ? { serial_number: serial } : {}),
+    ...(nb ? { not_before: nb } : {}),
+    ...(na ? { not_after: na } : {}),
+  };
+}
+
+/** An SSH host key as the typepack identifies it: SHA-256 of the decoded key blob, lowercase hex —
+ *  the bytes OpenSSH's `SHA256:` fingerprint and Censys' fingerprint_sha256 hash. NOT
+ *  `ssh.fingerprint`, which is the legacy MD5 form nothing else in the graph uses. The key type is
+ *  read from the blob's own first field, which is also what rejects a value that is not a key blob. */
+async function sshHostKey(b64) {
+  let bytes;
+  try {
+    bytes = Uint8Array.from(atob(String(b64).replace(/\s+/g, "")), (ch) => ch.charCodeAt(0));
+  } catch {
+    return null;
+  }
+  const len = bytes.length >= 4 ? ((bytes[0] << 24) | (bytes[1] << 16) | (bytes[2] << 8) | bytes[3]) >>> 0 : 0;
+  if (!len || len > 64 || 4 + len > bytes.length) return null;
+  const keyType = String.fromCharCode(...bytes.subarray(4, 4 + len));
+  if (!/^[a-z0-9@.-]+$/.test(keyType)) return null;
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return { fingerprint_sha256: [...digest].map((b) => b.toString(16).padStart(2, "0")).join(""), key_type: keyType };
+}
+
+/** "443: a; 8443: b" — the port says which listener a value came from, since each port of one IP
+ *  can answer differently. Capped, saying how many were left out. */
+function byPort(m) {
+  const parts = [...m].sort((x, y) => x[0] - y[0]).map(([p, v]) => `${p}: ${v}`);
+  if (!parts.length) return undefined;
+  return parts.length <= MAX_LISTED ? parts.join("; ") : `${parts.slice(0, MAX_LISTED).join("; ")} (+${parts.length - MAX_LISTED} more)`;
+}
+
 const emptyAgg = (ip) => ({
   ip,
   ports: new Set(),
@@ -176,7 +251,34 @@ const emptyAgg = (ip) => ({
   asn: "",
   os: "",
   location: null,
+  tags: new Set(),
+  certs: new Map(), // SHA-256 fingerprint -> certificate properties
+  favicons: new Set(), // http.favicon.hash, Shodan's signed MMH3
+  sshKeys: new Set(), // ssh.key, the base64 key blob
+  products: new Map(), // port -> "product version"
+  titles: new Map(), // port -> http.title
+  jarm: new Map(), // port -> ssl.jarm
 });
+
+/** One service's fingerprints and banners. A search match IS one service; /shodan/host/{ip} lists
+ *  them under data[]. Any of these fields can be absent on any service. */
+function collectService(a, s) {
+  if (!s) return;
+  for (const t of s.tags || []) if (t) a.tags.add(String(t));
+  const cert = certOf(s);
+  if (cert && !a.certs.has(cert.fingerprint_sha256)) a.certs.set(cert.fingerprint_sha256, cert);
+  const fav = s.http && s.http.favicon && s.http.favicon.hash;
+  if (Number.isInteger(fav)) a.favicons.add(fav);
+  const key = s.ssh && s.ssh.key;
+  if (typeof key === "string" && key.trim()) a.sshKeys.add(key);
+  if (!s.port) return;
+  if (s.product) a.products.set(s.port, s.version ? `${s.product} ${s.version}` : String(s.product));
+  const title = s.http && typeof s.http.title === "string" ? s.http.title.trim().slice(0, 200) : "";
+  if (title) a.titles.set(s.port, title);
+  // An all-zero JARM is what a listener that completed no TLS handshake hashes to — not a fingerprint.
+  const jarm = s.ssl && s.ssl.jarm;
+  if (typeof jarm === "string" && /[1-9a-f]/i.test(jarm)) a.jarm.set(s.port, jarm.toLowerCase());
+}
 
 /** Aggregate Shodan search matches by IP — a query can return several rows for one host (one per
  *  scanned port), and mergeNodeData does not UNION array-ish fields across separate createNode
@@ -200,6 +302,7 @@ function aggregateMatches(matches) {
     if (!a.asn && m.asn) a.asn = m.asn;
     if (!a.os && m.os) a.os = m.os;
     if (!a.location && m.location) a.location = m.location;
+    collectService(a, m);
   }
   return [...byIp.values()];
 }
@@ -213,8 +316,12 @@ function aggregateHost(body) {
   for (const p of b.ports || []) if (p) a.ports.add(p);
   // Per-service first: those detail objects carry the CVSS scores that rank the cap below. The
   // top-level list is bare ids and only fills in anything the services did not mention.
-  for (const svc of b.data || []) collectVulns(svc && svc.vulns, a.cves);
+  for (const svc of b.data || []) {
+    collectVulns(svc && svc.vulns, a.cves);
+    collectService(a, svc);
+  }
   collectVulns(b.vulns, a.cves);
+  for (const t of b.tags || []) if (t) a.tags.add(String(t));
   for (const h of b.hostnames || []) if (h) a.hostnames.add(String(h).trim().toLowerCase());
   a.org = b.org || "";
   a.isp = b.isp || "";
@@ -236,12 +343,20 @@ function aggregateHost(body) {
  *  second; identity would merge them anyway, but reusing the selection keeps the edges attached to
  *  what the analyst is looking at. */
 async function writeIp(ctx, agg, asNodeByAsn, existingIpId) {
-  const made = { ip: false, host: false, as: false, domains: 0, vulns: 0, cvesOmitted: 0, geo: false };
+  const made = { ip: false, host: false, as: false, domains: 0, vulns: 0, cvesOmitted: 0, geo: false, certs: 0, favicons: 0, hostKeys: 0 };
   const loc = agg.location || {};
   const country = cc2(loc.country_code);
   const firstHostname = [...agg.hostnames][0];
 
   let ipId = existingIpId ? String(existingIpId) : "";
+  // Shodan's own observations, prefixed like VirusTotal's vt_* fields: no typepack declares them,
+  // the property panel shows them, and the prefix says whose observation they are.
+  const observed = {
+    shodan_tags: agg.tags.size ? [...agg.tags].join(", ") : undefined,
+    shodan_products: byPort(agg.products),
+    shodan_http_title: byPort(agg.titles),
+    shodan_jarm: byPort(agg.jarm),
+  };
   const ipData = {
     ip_address: agg.ip,
     version: ipVersion(agg.ip),
@@ -249,6 +364,7 @@ async function writeIp(ctx, agg, asNodeByAsn, existingIpId) {
     ...(agg.org || agg.isp ? { organization: agg.org || agg.isp } : {}),
     ...(agg.asn ? { asn: String(agg.asn).toUpperCase() } : {}),
     ...(firstHostname ? { reverse_dns: firstHostname } : {}),
+    ...Object.fromEntries(Object.entries(observed).filter(([, v]) => v)),
   };
   if (ipId) {
     // Delta, not a snapshot: updateNode merges what it is given, so handing it only the fields
@@ -317,6 +433,28 @@ async function writeIp(ctx, agg, asNodeByAsn, existingIpId) {
     made.domains++;
   }
 
+  // What the services present. Labels match Censys Host Lookup (certificate, SSH key) and Web
+  // Recon (favicon), and each node's identity is its hash, so they converge with those packs' nodes.
+  for (const cert of agg.certs.values()) {
+    const cNode = await ctx.graph.createNode({ type: "infrastructure.certificate", data: cert });
+    await ctx.graph.createEdge({ from: ipId, to: String(cNode.id), label: "presents certificate" });
+    made.certs++;
+  }
+  for (const hash of agg.favicons) {
+    const fNode = await ctx.graph.createNode({ type: "web.favicon_hash", data: { hash_value: String(hash), hash_algorithm: "mmh3" } });
+    await ctx.graph.createEdge({ from: ipId, to: String(fNode.id), label: "has favicon" });
+    made.favicons++;
+  }
+  const seenKeys = new Set();
+  for (const blob of agg.sshKeys) {
+    const key = await sshHostKey(blob);
+    if (!key || seenKeys.has(key.fingerprint_sha256)) continue;
+    seenKeys.add(key.fingerprint_sha256);
+    const kNode = await ctx.graph.createNode({ type: "infrastructure.ssh_host_key", data: key });
+    await ctx.graph.createEdge({ from: ipId, to: String(kNode.id), label: "presents host key" });
+    made.hostKeys++;
+  }
+
   // A city or a region, or no node. Falling back to the bare country produced a "US" node pinned
   // at one host's coordinates that every US host in the run then merged into — a hub carrying no
   // fact. The country is already on the IP node, so declining loses nothing. The city||region
@@ -343,6 +481,16 @@ async function writeIp(ctx, agg, asNodeByAsn, existingIpId) {
   return made;
 }
 
+/** The fingerprint part of a run summary, or nothing when no service presented one. */
+function presented(t) {
+  const parts = [
+    t.certs ? `${t.certs} certificate(s)` : "",
+    t.favicons ? `${t.favicons} favicon hash(es)` : "",
+    t.hostKeys ? `${t.hostKeys} SSH host key(s)` : "",
+  ].filter(Boolean);
+  return parts.length ? `, ${parts.join(", ")}` : "";
+}
+
 /** Shared manifest boilerplate — every plugin here is the same author, license and platform, and
  *  every one needs the analyst's own key. */
 const AUTHOR = { name: "VINEYARD", url: "https://github.com/Vineyard-Intelligence" };
@@ -364,9 +512,9 @@ const hostPlugin = {
     identifier: "run.vineyard.plugins.shodan_host",
     content_type: "vineyard:plugin",
     name: "Shodan Host",
-    version: "2.0.2",
+    version: "2.1.0",
     description:
-      "Looks up each selected IP Address in Shodan and creates its Host with open ports (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP, highest CVSS first), reverse hostnames as Domain nodes (\"resolves to\"), its Autonomous System (\"announced by\") and Location (\"geolocated to\"); fills the IP's country_code, organization, asn and reverse_dns. Product/version banners and Shodan tags are listed in the run summary, not added as nodes. Does not spend a query credit; needs a Shodan API key.",
+      "Looks up each selected IP Address in Shodan and creates its Host with open ports (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP, highest CVSS first), reverse hostnames as Domain nodes (\"resolves to\"), its Autonomous System (\"announced by\"), Location (\"geolocated to\"), and what its services present: TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"). Fills the IP's country_code, organization, asn and reverse_dns, plus shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm. Does not spend a query credit; needs a Shodan API key.",
     icon: "server",
     author: AUTHOR,
     license: "Apache-2.0",
@@ -379,6 +527,9 @@ const hostPlugin = {
         io(T_INFRA, "infrastructure", "domain"),
         io("run.vineyard.typepacks.threat", "threat", "vulnerability"),
         io("run.vineyard.typepacks.geo", "geo", "location"),
+        io(T_INFRA, "infrastructure", "certificate"),
+        io(T_INFRA, "web", "favicon_hash"),
+        io(T_INFRA, "infrastructure", "ssh_host_key"),
       ],
     },
     scopes: {
@@ -403,7 +554,7 @@ const hostPlugin = {
     if (!ids.length) return { summary: "Select one or more IP Address nodes first", counts: { hosts: 0 } };
 
     const asNodeByAsn = new Map();
-    const totals = { hosts: 0, ports: 0, vulns: 0, omitted: 0, domains: 0, as: 0, geo: 0 };
+    const totals = { hosts: 0, ports: 0, vulns: 0, omitted: 0, domains: 0, as: 0, geo: 0, certs: 0, favicons: 0, hostKeys: 0 };
     const products = new Set();
     const tags = new Set();
     let unknown = 0;
@@ -447,6 +598,9 @@ const hostPlugin = {
       totals.domains += made.domains;
       if (made.as) totals.as++;
       if (made.geo) totals.geo++;
+      totals.certs += made.certs;
+      totals.favicons += made.favicons;
+      totals.hostKeys += made.hostKeys;
     }
 
     const notes = [
@@ -457,12 +611,15 @@ const hostPlugin = {
       tags.size ? `tags: ${[...tags].join(", ")}` : "",
     ].filter(Boolean);
     return {
-      summary: `${totals.hosts} host(s): ${totals.ports} open port(s), ${totals.vulns} CVE(s), ${totals.domains} hostname(s), ${totals.as} AS(es)${notes.length ? ` — ${notes.join("; ")}` : ""}`,
+      summary: `${totals.hosts} host(s): ${totals.ports} open port(s), ${totals.vulns} CVE(s), ${totals.domains} hostname(s), ${totals.as} AS(es)${presented(totals)}${notes.length ? ` — ${notes.join("; ")}` : ""}`,
       counts: {
         hosts: totals.hosts,
         open_ports: totals.ports,
         vulnerabilities: totals.vulns,
         domains: totals.domains,
+        certificates: totals.certs,
+        favicon_hashes: totals.favicons,
+        ssh_host_keys: totals.hostKeys,
         unknown,
         failed,
       },
@@ -477,9 +634,9 @@ const searchPlugin = {
     identifier: "run.vineyard.plugins.shodan_search",
     content_type: "vineyard:plugin",
     name: "Shodan Search",
-    version: "2.0.2",
+    version: "2.1.0",
     description:
-      "Runs a Shodan host search from a query in the Run dialog (no selection) and creates up to 100 matching IP Address nodes per page, each with its Host (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP), hostnames as Domain nodes (\"resolves to\"), Autonomous System (\"announced by\") and Location (\"geolocated to\"). Spends 1 query credit when the query uses a filter or for any page after the first; needs a Shodan API key.",
+      "Runs a Shodan host search from a query in the Run dialog (no selection) and creates up to 100 matching IP Address nodes per page, each with its Host (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP), hostnames as Domain nodes (\"resolves to\"), Autonomous System (\"announced by\"), Location (\"geolocated to\"), TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"), with shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm on the IP. Spends 1 query credit when the query uses a filter or for any page after the first; needs a Shodan API key.",
     icon: "search",
     author: AUTHOR,
     license: "Apache-2.0",
@@ -512,6 +669,9 @@ const searchPlugin = {
         io(T_INFRA, "infrastructure", "domain"),
         io("run.vineyard.typepacks.threat", "threat", "vulnerability"),
         io("run.vineyard.typepacks.geo", "geo", "location"),
+        io(T_INFRA, "infrastructure", "certificate"),
+        io(T_INFRA, "web", "favicon_hash"),
+        io(T_INFRA, "infrastructure", "ssh_host_key"),
       ],
     },
     scopes: {
@@ -542,7 +702,7 @@ const searchPlugin = {
 
     const aggregated = aggregateMatches(matches);
     const asNodeByAsn = new Map();
-    const totals = { ip: 0, host: 0, as: 0, domains: 0, vulns: 0, omitted: 0, geo: 0 };
+    const totals = { ip: 0, host: 0, as: 0, domains: 0, vulns: 0, omitted: 0, geo: 0, certs: 0, favicons: 0, hostKeys: 0 };
     for (let i = 0; i < aggregated.length; i++) {
       if (ctx.signal && ctx.signal.aborted) break;
       ctx.progress &&
@@ -556,13 +716,25 @@ const searchPlugin = {
       totals.domains += made.domains;
       totals.vulns += made.vulns;
       totals.omitted += made.cvesOmitted;
+      totals.certs += made.certs;
+      totals.favicons += made.favicons;
+      totals.hostKeys += made.hostKeys;
     }
     const capped = totals.omitted ? `, ${totals.omitted} lower-CVSS CVE(s) omitted by the ${MAX_CVES}/host cap` : "";
     const seen = page * 100;
     const more = total > seen ? ` — ${total - seen} more match this query (raise Page for the next 100, 1 credit each)` : "";
     return {
-      summary: `"${query}" p${page}: ${totals.ip} host(s), ${totals.host} exposing ports, ${totals.as} AS(es), ${totals.vulns} CVE(s), ${totals.geo} geolocated${capped}${more}`,
-      counts: { ips: totals.ip, hosts: totals.host, autonomous_systems: totals.as, vulnerabilities: totals.vulns, locations: totals.geo },
+      summary: `"${query}" p${page}: ${totals.ip} host(s), ${totals.host} exposing ports, ${totals.as} AS(es), ${totals.vulns} CVE(s), ${totals.geo} geolocated${presented(totals)}${capped}${more}`,
+      counts: {
+        ips: totals.ip,
+        hosts: totals.host,
+        autonomous_systems: totals.as,
+        vulnerabilities: totals.vulns,
+        locations: totals.geo,
+        certificates: totals.certs,
+        favicon_hashes: totals.favicons,
+        ssh_host_keys: totals.hostKeys,
+      },
     };
   },
 };
@@ -991,7 +1163,7 @@ export default {
     identifier: "run.vineyard.pluginpacks.shodan",
     content_type: "vineyard:pluginpack",
     name: "Shodan",
-    version: "2.0.3",
+    version: "2.1.0",
     description:
       "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
     author: AUTHOR,

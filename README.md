@@ -9,7 +9,7 @@ reaching for search every time. **Only Shodan Search spends a query credit.**
 
 | Plugin | Endpoint | Cost | Takes | Gives |
 | --- | --- | --- | --- | --- |
-| **Shodan Host** | `/shodan/host/{ip}` | free | selected IP Address nodes | ports, CVEs, reverse hostnames, AS, location — and product/version banners in the summary |
+| **Shodan Host** | `/shodan/host/{ip}` | free | selected IP Address nodes | ports, CVEs, reverse hostnames, AS, location, the TLS certificates, favicon hashes and SSH host keys its services present — and tags, products, HTTP titles and JARM on the IP |
 | **Shodan Search** | `/shodan/host/search` | **1 credit / page** | a query string | up to 100 hosts per page, same shapes as Host |
 | **Shodan Count** | `/shodan/host/count` | free | a query string | how many hosts match, plus facets — no nodes |
 | **Shodan DNS Domain** | `/dns/domain/{domain}` | free | selected Domain nodes | known subdomains + passive DNS records |
@@ -34,13 +34,22 @@ A CVE or an AS number reads the same on the canvas whichever plugin put it there
 | Approximate location | `geo.location` | `geolocated to` | IP Recon → IP Geolocation |
 | Subdomain | `infrastructure.domain` | `subdomain` | Domain Recon → Certificate Transparency |
 | DNS record | `infrastructure.dns_record` | `has record` | Domain Recon → DNS Lookup |
+| TLS certificate a service presents | `infrastructure.certificate` | `presents certificate` | VirusTotal → VT IP Report |
+| Favicon hash | `web.favicon_hash` | `has favicon` | Web Recon → Favicon Hash |
+| SSH host key | `infrastructure.ssh_host_key` | `presents host key` | Censys → Host Lookup |
+
+A certificate is identified by its SHA-256 fingerprint, a favicon by Shodan's MMH3 value and an SSH
+host key by the SHA-256 of the key (not Shodan's MD5 `ssh.fingerprint`), so the same one written by
+any of those packs is one node. A certificate serial is written only when Shodan's number for it is
+exact — a 128-bit serial arrives rounded, and is left for VirusTotal or Censys to fill.
 
 ### What is deliberately *not* a node
 
-- **Product and version** (`Apache httpd 2.4.7`, `OpenSSH 6.6.1p1`) and **Shodan tags** (`cloud`,
-  `honeypot`) are reported in the run summary instead. They are pivot *queries* — you read them and
-  feed them back into Shodan Search — not entities; an `nginx` node would become a hub shared by
-  millions of unrelated hosts.
+- **Product and version** (`Apache httpd 2.4.7`, `OpenSSH 6.6.1p1`), **Shodan tags** (`cloud`,
+  `honeypot`, `self-signed`), the **HTTP title** and the **JARM** are written onto the IP as
+  `shodan_products`, `shodan_tags`, `shodan_http_title` and `shodan_jarm` (per port, up to 25
+  entries). They are pivot *queries* — you read them and feed them back into Shodan Search — not
+  entities; an `nginx` node would become a hub shared by millions of unrelated hosts.
 - **The registrable `domains` list** on a host response, because it is just the `hostnames` with
   their labels chopped off. The hostnames themselves become nodes.
 
