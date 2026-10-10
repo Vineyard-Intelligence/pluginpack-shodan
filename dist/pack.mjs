@@ -357,12 +357,16 @@ async function writeIp(ctx, agg, asNodeByAsn, existingIpId) {
     shodan_http_title: byPort(agg.titles),
     shodan_jarm: byPort(agg.jarm),
   };
+  // ip_address.asn is a bare integer (infrastructure 3.0). Shodan spells it 'AS13335'; the same
+  // ASN_RE parse feeds the AS node below. AS0 ("not routed") is not an ASN to record on an IP.
+  const asnParsed = ASN_RE.exec(agg.asn || "");
+  const ipAsn = asnParsed ? Number(asnParsed[1]) : 0;
   const ipData = {
     ip_address: agg.ip,
     version: ipVersion(agg.ip),
     ...(country ? { country_code: country } : {}),
     ...(agg.org || agg.isp ? { organization: agg.org || agg.isp } : {}),
-    ...(agg.asn ? { asn: String(agg.asn).toUpperCase() } : {}),
+    ...(ipAsn > 0 && ipAsn <= 4294967295 ? { asn: ipAsn } : {}),
     ...(firstHostname ? { reverse_dns: firstHostname } : {}),
     ...Object.fromEntries(Object.entries(observed).filter(([, v]) => v)),
   };
@@ -512,7 +516,7 @@ const hostPlugin = {
     identifier: "run.vineyard.plugins.shodan_host",
     content_type: "vineyard:plugin",
     name: "Shodan Host",
-    version: "2.1.0",
+    version: "2.2.0",
     description:
       "Looks up each selected IP Address in Shodan and creates its Host with open ports (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP, highest CVSS first), reverse hostnames as Domain nodes (\"resolves to\"), its Autonomous System (\"announced by\"), Location (\"geolocated to\"), and what its services present: TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"). Fills the IP's country_code, organization, asn and reverse_dns, plus shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm. Does not spend a query credit; needs a Shodan API key.",
     icon: "server",
@@ -634,7 +638,7 @@ const searchPlugin = {
     identifier: "run.vineyard.plugins.shodan_search",
     content_type: "vineyard:plugin",
     name: "Shodan Search",
-    version: "2.1.0",
+    version: "2.2.0",
     description:
       "Runs a Shodan host search from a query in the Run dialog (no selection) and creates up to 100 matching IP Address nodes per page, each with its Host (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP), hostnames as Domain nodes (\"resolves to\"), Autonomous System (\"announced by\"), Location (\"geolocated to\"), TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"), with shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm on the IP. Spends 1 query credit when the query uses a filter or for any page after the first; needs a Shodan API key.",
     icon: "search",
@@ -1163,7 +1167,7 @@ export default {
     identifier: "run.vineyard.pluginpacks.shodan",
     content_type: "vineyard:pluginpack",
     name: "Shodan",
-    version: "2.1.0",
+    version: "2.2.0",
     description:
       "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
     author: AUTHOR,

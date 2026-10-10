@@ -120,7 +120,7 @@ const KEY = { api_key: "k" };
   check("host: enriches the SELECTED ip node instead of creating a second", graph.updates.length === 1 && graph.updates[0].id === "ip1");
   check("host: no new ip_address node was created", !graph.createdNodes.some((n) => n.type === "infrastructure.ip_address"));
   const upd = (graph.updates[0] || {}).data || {}; // a failed update assertion above must not crash the rest
-  check("host: asn written back onto the ip node", upd.asn === "AS63949");
+  check("host: asn written back onto the ip node as the integer the type pack declares", upd.asn === 63949);
   check("host: organization written back", upd.organization === "Akamai");
   check("host: reverse_dns takes the first hostname", upd.reverse_dns === "scanme.nmap.org");
   const h = graph.createdNodes.find((n) => n.type === "infrastructure.host");
