@@ -60,10 +60,10 @@ number dropped is stated in the run summary.
 
 ## Your API key
 
-Every plugin declares its own `api_key` setting, but you only paste it **once**: the app copies a
-value you type into any row to the other plugins in the same pack that declare the same key. After
-that it is remembered (encrypted, desktop OS keychain) or held for the session (browser
-`sessionStorage`).
+Every plugin declares its own `api_key` setting, but you only paste it **once**: all seven call
+`https://api.shodan.io`, so they share one stored value. Enter it in any plugin's Settings block in
+the Run plugins dialog, or under **Settings → Keys & Secrets**. It is remembered (encrypted, desktop
+OS keychain) or held for the session (browser `sessionStorage`).
 
 The key is sent only as Shodan's own `?key=` query parameter.
 

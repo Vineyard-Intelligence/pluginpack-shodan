@@ -128,9 +128,9 @@ const NO_KEY = "No Shodan API key configured — add one in Settings below.";
 // ---- shared: node/edge shaping (mirrors the free packs — see file header) -------------------
 
 const isDomain = (n) => n.type === "infrastructure.domain";
-const domainOf = (n) => String((n.data && n.data.domain_name) || (n.data && n.data.value) || "").trim().toLowerCase();
+const domainOf = (n) => String((n.data && n.data.domain_name) || "").trim().toLowerCase();
 const isIp = (n) => n.type === "infrastructure.ip_address";
-const ipOf = (n) => String((n.data && n.data.ip_address) || (n.data && n.data.value) || "").trim();
+const ipOf = (n) => String((n.data && n.data.ip_address) || "").trim();
 const ipVersion = (ip) => (String(ip).includes(":") ? "ipv6" : "ipv4");
 const cc2 = (s) => {
   const v = String(s || "").toUpperCase();
@@ -498,11 +498,9 @@ function presented(t) {
 /** Shared manifest boilerplate — every plugin here is the same author, license and platform, and
  *  every one needs the analyst's own key. */
 const AUTHOR = { name: "VINEYARD", url: "https://github.com/Vineyard-Intelligence" };
-// `entry` is the PACK's module, repeated on every member — NOT "inline". Measured the hard way:
-// "inline" means "a plugin bundled into the app", nothing is bundled any more, and registry.ts's
-// isRemoteRunnable() drops such a member on the floor. A pack that declares it installs fine,
-// shows nothing in the run dialog, and gives no diagnostic. Every other pack in the catalog says
-// dist/pack.mjs here; test-plugin.mjs now refuses to let this one drift back.
+// `entry` is the PACK's module, repeated on every member. A member whose entry is not a module path
+// is not remote-runnable: the app drops it, so the pack installs fine, shows nothing in the run
+// dialog, and gives no diagnostic. test-plugin.mjs checks every member.
 const PACK_ENTRY = "dist/pack.mjs";
 const WEB = { primary: "web", web: { runtime: "sandbox-js", entry: PACK_ENTRY } };
 const KEY_CONFIG = [{ key: "api_key", label: "Shodan API Key", type: "string", secret: true, optional: false }];
