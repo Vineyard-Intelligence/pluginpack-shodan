@@ -583,6 +583,7 @@ const DEVICE_CERT = {
     );
 
   check("manifest: pack version agrees", json.version === pack.manifest.version);
+  check("manifest: pack summary and page agree", json.summary === pack.manifest.summary && json.description === pack.manifest.description);
   check("manifest: pack identifier agrees", json.identifier === pack.manifest.identifier);
   check("manifest: member count agrees", json.plugins.length === pack.plugins.length);
   for (let i = 0; i < json.plugins.length; i++) {
