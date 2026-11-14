@@ -41,7 +41,9 @@ A CVE or an AS number reads the same on the canvas whichever plugin put it there
 A certificate is identified by its SHA-256 fingerprint, a favicon by Shodan's MMH3 value and an SSH
 host key by the SHA-256 of the key (not Shodan's MD5 `ssh.fingerprint`), so the same one written by
 any of those packs is one node. A certificate serial is written only when Shodan's number for it is
-exact — a 128-bit serial arrives rounded, and is left for VirusTotal or Censys to fill.
+exact — a 128-bit serial arrives rounded, and is left for VirusTotal or Censys to fill. The
+certificate's SHA-1 goes into `fingerprint_sha1`: the abuse.ch SSLBL blacklist names certificates by
+SHA-1 alone, and the abuse.ch pack's SSLBL Certificate Check matches on it.
 
 ### What is deliberately *not* a node
 

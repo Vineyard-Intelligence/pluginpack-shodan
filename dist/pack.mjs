@@ -175,6 +175,7 @@ function collectVulns(vulns, into) {
 }
 
 const hex64 = (v) => (typeof v === "string" && /^[0-9a-f]{64}$/i.test(v.trim()) ? v.trim().toLowerCase() : "");
+const hex40 = (v) => (typeof v === "string" && /^[0-9a-f]{40}$/i.test(v.trim()) ? v.trim().toLowerCase() : "");
 
 /** Shodan stamps certificate validity as ASN.1 time (`20171123000000Z`); the typepack declares datetime. */
 function certTime(v) {
@@ -193,11 +194,16 @@ function serialHex(v) {
 }
 
 /** The leaf certificate a service presented, as typepack properties — shaped like VirusTotal's
- *  (issuer as "O — CN"), which reads Shodan's subject/issuer dictionaries the same way. */
+ *  (issuer as "O — CN"), which reads Shodan's subject/issuer dictionaries the same way.
+ *
+ *  The SHA-1 rides along because a SHA-256 cannot be turned into one, and the abuse.ch SSLBL
+ *  certificate blacklist names certificates by SHA-1 only: without it a certificate Shodan found
+ *  can never be matched against the families SSLBL lists. Identity stays the SHA-256. */
 function certOf(svc) {
   const c = svc && svc.ssl && svc.ssl.cert;
   const fp = hex64(c && c.fingerprint && c.fingerprint.sha256);
   if (!fp) return null;
+  const sha1 = hex40(c.fingerprint.sha1);
   const str = (x) => (typeof x === "string" && x ? x : undefined);
   const cn = str(c.subject && c.subject.CN);
   const issuer = [c.issuer && c.issuer.O, c.issuer && c.issuer.CN].filter(str).join(" — ");
@@ -206,6 +212,7 @@ function certOf(svc) {
   const na = certTime(c.expires);
   return {
     fingerprint_sha256: fp,
+    ...(sha1 ? { fingerprint_sha1: sha1 } : {}),
     ...(cn ? { subject_common_name: cn } : {}),
     ...(issuer ? { issuer } : {}),
     ...(serial ? { serial_number: serial } : {}),
@@ -514,7 +521,7 @@ const hostPlugin = {
     identifier: "run.vineyard.plugins.shodan_host",
     content_type: "vineyard:plugin",
     name: "Shodan Host",
-    version: "2.2.0",
+    version: "2.3.0",
     description:
       "Looks up each selected IP Address in Shodan and creates its Host with open ports (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP, highest CVSS first), reverse hostnames as Domain nodes (\"resolves to\"), its Autonomous System (\"announced by\"), Location (\"geolocated to\"), and what its services present: TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"). Fills the IP's country_code, organization, asn and reverse_dns, plus shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm. Does not spend a query credit; needs a Shodan API key.",
     icon: "server",
@@ -636,7 +643,7 @@ const searchPlugin = {
     identifier: "run.vineyard.plugins.shodan_search",
     content_type: "vineyard:plugin",
     name: "Shodan Search",
-    version: "2.2.0",
+    version: "2.3.0",
     description:
       "Runs a Shodan host search from a query in the Run dialog (no selection) and creates up to 100 matching IP Address nodes per page, each with its Host (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP), hostnames as Domain nodes (\"resolves to\"), Autonomous System (\"announced by\"), Location (\"geolocated to\"), TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"), with shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm on the IP. Spends 1 query credit when the query uses a filter or for any page after the first; needs a Shodan API key.",
     icon: "search",
@@ -1186,7 +1193,7 @@ export default {
     identifier: "run.vineyard.pluginpacks.shodan",
     content_type: "vineyard:pluginpack",
     name: "Shodan",
-    version: "2.3.1",
+    version: "2.4.0",
     summary:
       "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
     description: PACK_PAGE,

@@ -339,7 +339,7 @@ const GITLAB_CERT = {
   issued: "20171123000000Z",
   expires: "20190121235959Z",
   version: 2,
-  fingerprint: { sha256: "0B1E768B492663D9D236C40DE17BE1A379A2E3146C2AA8890E613FB3095A0D92", sha1: "e19d2258e5f9f5aa35e4c9be2f60c0a34c08492e" },
+  fingerprint: { sha256: "0B1E768B492663D9D236C40DE17BE1A379A2E3146C2AA8890E613FB3095A0D92", sha1: "E19D2258E5F9F5AA35E4C9BE2F60C0A34C08492E" },
   serial: 1.908545518767334e38,
   issuer: { C: "GB", ST: "Greater Manchester", CN: "COMODO RSA Domain Validation Secure Server CA", O: "COMODO CA Limited", L: "Salford" },
   subject: { OU: "PositiveSSL", CN: "gitlab.com" },
@@ -383,6 +383,9 @@ const DEVICE_CERT = {
   const device = certs.find((n) => n.data.subject_common_name === "FortiGate");
   check("fp: one certificate node per distinct fingerprint, not per port", certs.length === 2);
   check("fp: certificate identity is the lowercased SHA-256", gitlab && gitlab.data.fingerprint_sha256 === GITLAB_CERT.fingerprint.sha256.toLowerCase());
+  // SSLBL lists certificates by SHA-1 only, and a SHA-256 cannot be turned into one.
+  check("fp: the SHA-1 Shodan reports is kept, lowercased, as fingerprint_sha1", gitlab && gitlab.data.fingerprint_sha1 === "e19d2258e5f9f5aa35e4c9be2f60c0a34c08492e");
+  check("fp: a certificate Shodan gives no SHA-1 for gets no fingerprint_sha1 key", device && !("fingerprint_sha1" in device.data));
   check("fp: issuer reads 'O — CN', as VirusTotal writes it", gitlab && gitlab.data.issuer === "COMODO CA Limited — COMODO RSA Domain Validation Secure Server CA");
   check("fp: ASN.1 validity becomes ISO datetimes", gitlab && gitlab.data.not_before === "2017-11-23T00:00:00Z" && gitlab.data.not_after === "2019-01-21T23:59:59Z");
   // A 128-bit serial arrives as a rounded float; written, it would clobber the exact one VT/Censys wrote.
@@ -425,6 +428,7 @@ const DEVICE_CERT = {
   const certIds = new Set(graph.createdNodes.filter((n) => n.type === "infrastructure.certificate" && n.data.fingerprint_sha256 === GITLAB_CERT.fingerprint.sha256.toLowerCase()).map((n) => n.id));
   const certEdges = graph.createdEdges.filter((e) => e.label === "presents certificate" && certIds.has(e.to));
   check("search fp: both IPs present the shared certificate", ip1 && ip2 && certEdges.some((e) => e.from === ip1.id) && certEdges.some((e) => e.from === ip2.id));
+  check("search fp: a searched certificate keeps its SHA-1 too", graph.createdNodes.some((n) => certIds.has(n.id) && n.data.fingerprint_sha1 === "e19d2258e5f9f5aa35e4c9be2f60c0a34c08492e"));
   check("search fp: rows of one IP aggregate their favicon and SSH key onto it", graph.createdEdges.some((e) => e.from === ip1?.id && e.label === "has favicon") && graph.createdEdges.some((e) => e.from === ip1?.id && e.label === "presents host key"));
   check("search fp: tags, title and JARM ride on the created IP (search has no node:update)", ip1 && ip1.data.shodan_tags === "cdn" && ip1.data.shodan_http_title === "443: Panel" && /^443: 2ad2ad/.test(ip1.data.shodan_jarm));
   check("search fp: an IP with no such fields gets no empty shodan_* keys", ip2 && !Object.keys(ip2.data).some((k) => k.startsWith("shodan_")));
