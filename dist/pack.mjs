@@ -502,8 +502,9 @@ function presented(t) {
   return parts.length ? `, ${parts.join(", ")}` : "";
 }
 
-/** Shared manifest boilerplate — every plugin here is the same author, license and platform, and
- *  every one needs the analyst's own key. */
+/** Shared manifest boilerplate — every plugin here has the same license and platform, and every
+ *  one needs the analyst's own key. The author is the pack's alone: the registry's pluginpack
+ *  schema allows no author on a member, and 2.3.1 failed it for repeating it on all seven. */
 const AUTHOR = { name: "VINEYARD", url: "https://github.com/Vineyard-Intelligence" };
 // `entry` is the PACK's module, repeated on every member. A member whose entry is not a module path
 // is not remote-runnable: the app drops it, so the pack installs fine, shows nothing in the run
@@ -525,7 +526,6 @@ const hostPlugin = {
     description:
       "Looks up each selected IP Address in Shodan and creates its Host with open ports (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP, highest CVSS first), reverse hostnames as Domain nodes (\"resolves to\"), its Autonomous System (\"announced by\"), Location (\"geolocated to\"), and what its services present: TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"). Fills the IP's country_code, organization, asn and reverse_dns, plus shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm. Does not spend a query credit; needs a Shodan API key.",
     icon: "server",
-    author: AUTHOR,
     license: "Apache-2.0",
     platforms: WEB,
     io: {
@@ -647,7 +647,6 @@ const searchPlugin = {
     description:
       "Runs a Shodan host search from a query in the Run dialog (no selection) and creates up to 100 matching IP Address nodes per page, each with its Host (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP), hostnames as Domain nodes (\"resolves to\"), Autonomous System (\"announced by\"), Location (\"geolocated to\"), TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"), with shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm on the IP. Spends 1 query credit when the query uses a filter or for any page after the first; needs a Shodan API key.",
     icon: "search",
-    author: AUTHOR,
     license: "Apache-2.0",
     platforms: WEB,
     params: {
@@ -759,7 +758,6 @@ const countPlugin = {
     description:
       "Counts the hosts matching a Shodan search query from the Run dialog (no selection) and reports the total and facet breakdowns (default: country, org, port, product) in the run summary; creates no nodes. Does not spend a query credit; needs a Shodan API key.",
     icon: "chart-bar",
-    author: AUTHOR,
     license: "Apache-2.0",
     platforms: WEB,
     params: {
@@ -827,7 +825,6 @@ const dnsDomainPlugin = {
     description:
       "Fetches Shodan's passively observed DNS data for each selected Domain: subdomains become Domain nodes (\"subdomain\", up to 150 per domain) and DNS records become DNS Record nodes (\"has record\", up to 300 per domain). Does not spend a query credit; needs a Shodan API key.",
     icon: "waypoints",
-    author: AUTHOR,
     license: "Apache-2.0",
     platforms: WEB,
     io: {
@@ -942,7 +939,6 @@ const dnsResolvePlugin = {
     description:
       "Resolves each selected Domain to its IP address through Shodan, creating an IP Address node with a \"resolves to\" edge from the domain. Does not spend a query credit; needs a Shodan API key.",
     icon: "arrow-right",
-    author: AUTHOR,
     license: "Apache-2.0",
     platforms: WEB,
     io: {
@@ -1033,7 +1029,6 @@ const dnsReversePlugin = {
     description:
       "Looks up the PTR hostnames of each selected IP Address through Shodan, creating a Domain node per hostname with a \"resolves to\" edge from the IP, and writes the first hostname to the IP's reverse_dns. Does not spend a query credit; needs a Shodan API key.",
     icon: "arrow-left",
-    author: AUTHOR,
     license: "Apache-2.0",
     platforms: WEB,
     io: {
@@ -1127,7 +1122,6 @@ const statusPlugin = {
     description:
       "Reports the configured Shodan key's plan and remaining query and scan credits in the run summary; runs without a selection and creates no nodes. Does not spend a credit; needs a Shodan API key.",
     icon: "gauge",
-    author: AUTHOR,
     license: "Apache-2.0",
     platforms: WEB,
     io: { consumes: [], produces: [] },
@@ -1193,7 +1187,7 @@ export default {
     identifier: "run.vineyard.pluginpacks.shodan",
     content_type: "vineyard:pluginpack",
     name: "Shodan",
-    version: "2.4.0",
+    version: "2.4.1",
     summary:
       "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
     description: PACK_PAGE,

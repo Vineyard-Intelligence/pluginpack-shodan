@@ -2,7 +2,7 @@
   "identifier": "run.vineyard.pluginpacks.shodan",
   "content_type": "vineyard:pluginpack",
   "name": "Shodan",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "summary": "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
   "description": "Shodan's paid REST API: what Shodan has indexed about a host, which hosts match a query, and DNS around them, at the lowest credit cost that answers the question. Keyless IP enrichment, including Shodan's InternetDB, is in the IP Recon pack.\n\n**Needs:** a Shodan account and API key (https://www.shodan.io/); one key serves all seven plugins.\n\n**Cost:** credit use was measured against a live key by reading `/api-info` before and after each call. Shodan Count and Shodan API Status check for free before spending.\n\n**Who sees it:** Shodan receives every IP address, domain and query, with the API key as the `?key=` query parameter (Shodan's API has no header option). The target is never contacted.\n\n**Read results with care:**\n- The Autonomous System carries only the ASN; Shodan's country is where the IP geolocates, not where the AS is registered.\n- Products, tags, HTTP titles and JARM stay on the IP (up to 25 per-port entries) as values to feed back into Shodan Search; as nodes they would join millions of unrelated hosts.\n- An SSH host key is the SHA-256 of the key, not Shodan's MD5 `ssh.fingerprint`. A 128-bit certificate serial arrives rounded from Shodan, so it is left empty.\n\n**Data and licences:** Shodan's data, under the analyst's own Shodan account.\n\n**Source:** https://github.com/Vineyard-Intelligence/pluginpack-shodan (Apache-2.0)",
   "author": {
@@ -26,10 +26,6 @@
       "version": "2.3.0",
       "description": "Looks up each selected IP Address in Shodan and creates its Host with open ports (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP, highest CVSS first), reverse hostnames as Domain nodes (\"resolves to\"), its Autonomous System (\"announced by\"), Location (\"geolocated to\"), and what its services present: TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"). Fills the IP's country_code, organization, asn and reverse_dns, plus shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm. Does not spend a query credit; needs a Shodan API key.",
       "icon": "server",
-      "author": {
-        "name": "VINEYARD",
-        "url": "https://github.com/Vineyard-Intelligence"
-      },
       "license": "Apache-2.0",
       "platforms": {
         "primary": "web",
@@ -131,10 +127,6 @@
       "version": "2.3.0",
       "description": "Runs a Shodan host search from a query in the Run dialog (no selection) and creates up to 100 matching IP Address nodes per page, each with its Host (\"exposes\"), CVEs as Vulnerability nodes (\"affected by\", up to 25 per IP), hostnames as Domain nodes (\"resolves to\"), Autonomous System (\"announced by\"), Location (\"geolocated to\"), TLS Certificates (\"presents certificate\"), Favicon Hashes (\"has favicon\") and SSH Host Keys (\"presents host key\"), with shodan_tags and, per port, shodan_products, shodan_http_title and shodan_jarm on the IP. Spends 1 query credit when the query uses a filter or for any page after the first; needs a Shodan API key.",
       "icon": "search",
-      "author": {
-        "name": "VINEYARD",
-        "url": "https://github.com/Vineyard-Intelligence"
-      },
       "license": "Apache-2.0",
       "platforms": {
         "primary": "web",
@@ -254,10 +246,6 @@
       "version": "2.0.2",
       "description": "Counts the hosts matching a Shodan search query from the Run dialog (no selection) and reports the total and facet breakdowns (default: country, org, port, product) in the run summary; creates no nodes. Does not spend a query credit; needs a Shodan API key.",
       "icon": "chart-bar",
-      "author": {
-        "name": "VINEYARD",
-        "url": "https://github.com/Vineyard-Intelligence"
-      },
       "license": "Apache-2.0",
       "platforms": {
         "primary": "web",
@@ -324,10 +312,6 @@
       "version": "2.0.1",
       "description": "Fetches Shodan's passively observed DNS data for each selected Domain: subdomains become Domain nodes (\"subdomain\", up to 150 per domain) and DNS records become DNS Record nodes (\"has record\", up to 300 per domain). Does not spend a query credit; needs a Shodan API key.",
       "icon": "waypoints",
-      "author": {
-        "name": "VINEYARD",
-        "url": "https://github.com/Vineyard-Intelligence"
-      },
       "license": "Apache-2.0",
       "platforms": {
         "primary": "web",
@@ -398,10 +382,6 @@
       "version": "2.0.1",
       "description": "Resolves each selected Domain to its IP address through Shodan, creating an IP Address node with a \"resolves to\" edge from the domain. Does not spend a query credit; needs a Shodan API key.",
       "icon": "arrow-right",
-      "author": {
-        "name": "VINEYARD",
-        "url": "https://github.com/Vineyard-Intelligence"
-      },
       "license": "Apache-2.0",
       "platforms": {
         "primary": "web",
@@ -467,10 +447,6 @@
       "version": "2.0.1",
       "description": "Looks up the PTR hostnames of each selected IP Address through Shodan, creating a Domain node per hostname with a \"resolves to\" edge from the IP, and writes the first hostname to the IP's reverse_dns. Does not spend a query credit; needs a Shodan API key.",
       "icon": "arrow-left",
-      "author": {
-        "name": "VINEYARD",
-        "url": "https://github.com/Vineyard-Intelligence"
-      },
       "license": "Apache-2.0",
       "platforms": {
         "primary": "web",
@@ -537,10 +513,6 @@
       "version": "2.0.1",
       "description": "Reports the configured Shodan key's plan and remaining query and scan credits in the run summary; runs without a selection and creates no nodes. Does not spend a credit; needs a Shodan API key.",
       "icon": "gauge",
-      "author": {
-        "name": "VINEYARD",
-        "url": "https://github.com/Vineyard-Intelligence"
-      },
       "license": "Apache-2.0",
       "platforms": {
         "primary": "web",

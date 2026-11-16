@@ -586,6 +586,7 @@ const DEVICE_CERT = {
       x && typeof x === "object" && !Array.isArray(x) ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]])) : x,
     );
 
+  const MEMBER_KEYS = ["content_type", "description", "icon", "identifier", "io", "license", "lifecycle", "name", "params", "platforms", "scopes", "version"];
   check("manifest: pack version agrees", json.version === pack.manifest.version);
   check("manifest: pack summary and page agree", json.summary === pack.manifest.summary && json.description === pack.manifest.description);
   check("manifest: pack identifier agrees", json.identifier === pack.manifest.identifier);
@@ -603,7 +604,13 @@ const DEVICE_CERT = {
     // Every plugin that writes to the graph must say so, or the run silently no-ops on createNode.
     const writes = (a.io.produces || []).length > 0;
     check(`${a.identifier}: graph scope matches whether it produces nodes`, writes === !!(a.scopes.graph || []).includes("node:create"));
+    // The registry validates the pack document against its pluginpack schema, whose members allow
+    // only these keys and these lengths. 2.3.1 repeated the pack's author on every member and
+    // failed it.
+    check(`${a.identifier}: carries only the keys a pack member may have`, Object.keys(a).every((k) => MEMBER_KEYS.includes(k)));
+    check(`${a.identifier}: name and description within the member limits`, a.name.length <= 128 && a.description.length <= 1024);
   }
+  check("manifest: summary within the registry's 250 characters", json.summary.length <= 250);
 }
 
 say(`PASS ${ok.length} / ${ok.length + fail.length}`);
