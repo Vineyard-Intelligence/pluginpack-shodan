@@ -579,9 +579,11 @@ const DEVICE_CERT = {
 // ================================================================ raw results: ctx.retain
 // check:retain-feature-detect. Invariants, from the plugin raw results spec (§5, §9-1, §12):
 //   - Host keeps its answer on the selected IP, op "host": a 2xx, and the 404 "never scanned"
-//     answer too. Search keeps one call per IP, op "search", with that IP's raw rows. DNS Domain keeps
-//     the answer on its domain, op "domain"; Resolve and Reverse keep each node's own entry of the
-//     batch, {[name]: value}, ops "resolve" and "reverse".
+//     answer too. DNS Domain keeps the answer on its domain, op "domain". Resolve and Reverse keep
+//     the answer whole when the request asked about one node, ops "resolve" and "reverse".
+//   - Only an original answer is kept (analyst's decision, 2026-11-25): Search keeps nothing, and a
+//     batched Resolve/Reverse answer keeps nothing, since a part cut out of either is not the
+//     answer Shodan sent.
 //   - Count and API Status never keep anything: no node, and /api-info is the account itself.
 //   - Status 0 (cancelled, refused, network error) is never kept. Its error can be the host's
 //     "network egress denied: GET <url>" with the key in ?key=, so nothing handed to retain may
@@ -673,7 +675,7 @@ const DEVICE_CERT = {
       check(`retain ${name}: a rejected key keeps nothing`, retain.calls.length === 0);
     }
   }
-  // ---- search: once per IP, with that IP's raw rows
+  // ---- search: keeps nothing, since each IP's rows are a cut of the page
   {
     const retain = spy();
     const matches = [
@@ -682,11 +684,9 @@ const DEVICE_CERT = {
       { ip_str: "1.2.3.4", port: 443 },
     ];
     const graph = makeGraph({});
-    await searchPlugin.run({ config: SKEY, params: { query: "org:test" }, input: { selection: [] }, net: makeNet(() => ({ status: 200, body: { matches, total: 3 }, headers: HEADERS })), graph, retain, ...RUN });
-    const ipNode = (v) => graph.createdNodes.find((n) => n.type === "infrastructure.ip_address" && n.data.ip_address === v);
-    check("retain search: one call per IP, on the IP node it created, op search", sig(retain.calls) === `${ipNode("1.2.3.4").id}:search:200,${ipNode("5.6.7.8").id}:search:200`);
-    check("retain search: each IP keeps all of its rows and only its rows", JSON.stringify(bodyOf(retain.calls[0])) === JSON.stringify({ total: 3, matches: [matches[0], matches[2]] }) && JSON.stringify(bodyOf(retain.calls[1])) === JSON.stringify({ total: 3, matches: [matches[1]] }));
-    check("retain search: no key or URL in anything kept", leaks(retain.calls).length === 0);
+    const r = await searchPlugin.run({ config: SKEY, params: { query: "org:test" }, input: { selection: [] }, net: makeNet(() => ({ status: 200, body: { matches, total: 3 }, headers: HEADERS })), graph, retain, ...RUN });
+    check("retain search: keeps nothing", retain.calls.length === 0);
+    check("retain search: still maps every IP", r.counts.ips === 2);
   }
   // ---- DNS: the domain answer whole; resolve and reverse per node
   {
@@ -701,12 +701,20 @@ const DEVICE_CERT = {
     const res = spy();
     const resolveNodes = { d1: dom("d1", "a.example.test"), d2: dom("d2", "b.example.test"), d3: dom("d3", "a.example.test") };
     await dnsResolvePlugin.run({ config: SKEY, input: { selection: ["d1", "d2", "d3"] }, net: makeNet(() => ({ status: 200, body: { "a.example.test": "10.0.0.1", "b.example.test": null } })), graph: makeGraph(resolveNodes), retain: res, ...RUN });
-    check("retain dns_resolve: each domain its own entry, unresolved included, op resolve", sig(res.calls) === "d1:resolve:200,d2:resolve:200" && JSON.stringify(bodyOf(res.calls[0])) === '{"a.example.test":"10.0.0.1"}' && JSON.stringify(bodyOf(res.calls[1])) === '{"b.example.test":null}');
+    check("retain dns_resolve: a batched answer keeps nothing", res.calls.length === 0);
+    const one = spy();
+    const oneBody = { "b.example.test": null };
+    await dnsResolvePlugin.run({ config: SKEY, input: { selection: ["d2"] }, net: makeNet(() => ({ status: 200, body: oneBody })), graph: makeGraph(resolveNodes), retain: one, ...RUN });
+    check("retain dns_resolve: a one-name answer whole on its domain, unresolved included, op resolve", sig(one.calls) === "d2:resolve:200" && JSON.stringify(bodyOf(one.calls[0])) === JSON.stringify(oneBody));
 
     const rev = spy();
     await dnsReversePlugin.run({ config: SKEY, input: { selection: ["a", "b"] }, net: makeNet(() => ({ status: 200, body: { "8.8.8.8": ["dns.google"], "192.0.2.1": null } })), graph: makeGraph({ a: ip("a", "8.8.8.8"), b: ip("b", "192.0.2.1") }), retain: rev, ...RUN });
-    check("retain dns_reverse: each IP its own entry, no-PTR included, op reverse", sig(rev.calls) === "a:reverse:200,b:reverse:200" && JSON.stringify(bodyOf(rev.calls[0])) === '{"8.8.8.8":["dns.google"]}' && JSON.stringify(bodyOf(rev.calls[1])) === '{"192.0.2.1":null}');
-    check("retain dns: no key or URL in anything kept", leaks([...retain.calls, ...res.calls, ...rev.calls]).length === 0);
+    check("retain dns_reverse: a batched answer keeps nothing", rev.calls.length === 0);
+    const oneRev = spy();
+    const revBody = { "8.8.8.8": ["dns.google"] };
+    await dnsReversePlugin.run({ config: SKEY, input: { selection: ["a"] }, net: makeNet(() => ({ status: 200, body: revBody })), graph: makeGraph({ a: ip("a", "8.8.8.8") }), retain: oneRev, ...RUN });
+    check("retain dns_reverse: a one-address answer whole on its IP, op reverse", sig(oneRev.calls) === "a:reverse:200" && JSON.stringify(bodyOf(oneRev.calls[0])) === JSON.stringify(revBody));
+    check("retain dns: no key or URL in anything kept", leaks([...retain.calls, ...one.calls, ...oneRev.calls]).length === 0);
   }
   // ---- Count and API Status never keep
   {
@@ -719,10 +727,10 @@ const DEVICE_CERT = {
   {
     const log = logsOf();
     const refuse = spy(async () => ({ kept: false, reason: "over this run's raw-result budget" }));
-    const matches = [{ ip_str: "1.1.1.1", port: 80 }, { ip_str: "2.2.2.2", port: 80 }, { ip_str: "3.3.3.3", port: 80 }];
-    const r = await searchPlugin.run({ config: SKEY, params: { query: "q" }, input: { selection: [] }, net: makeNet(() => ({ status: 200, body: { matches, total: 3 } })), graph: makeGraph({}), retain: refuse, progress: log.progress, ...RUN }).catch((e) => e);
-    check("retain refusal: the search still succeeds", !(r instanceof Error) && r.counts.ips === 3 && refuse.calls.length === 3);
-    check("retain refusal: said once, not once per IP", log.lines.filter((l) => /Raw search result not kept — over this run's raw-result budget/.test(l)).length === 1);
+    const three = { a: ip("a", "198.51.100.7"), b: ip("b", "198.51.100.8"), c: ip("c", "198.51.100.9") };
+    const r = await hostPlugin.run({ config: SKEY, input: { selection: ["a", "b", "c"] }, net: makeNet(() => ({ status: 200, body: hostBody })), graph: makeGraph(three), retain: refuse, progress: log.progress, ...RUN }).catch((e) => e);
+    check("retain refusal: the lookup still succeeds", !(r instanceof Error) && r.counts.hosts === 3 && refuse.calls.length === 3);
+    check("retain refusal: said once, not once per IP", log.lines.filter((l) => /Raw host result not kept — over this run's raw-result budget/.test(l)).length === 1);
     const tlog = logsOf();
     const thrower = spy(async () => {
       throw new Error("host blew up");
@@ -732,7 +740,7 @@ const DEVICE_CERT = {
     check("retain throw: logged without the host's message", tlog.lines.some((l) => /Raw host result not kept/.test(l)) && !tlog.lines.some((l) => /blew up/.test(l)));
   }
   // ---- only the pack version moved, which is what the update check compares
-  check("pack version is 2.5.0", pack.manifest.version === "2.5.0");
+  check("pack version is 2.6.0", pack.manifest.version === "2.6.0");
   check("member versions unchanged", pack.plugins.map((p) => p.manifest.version).join() === "2.3.0,2.3.0,2.0.2,2.0.1,2.0.1,2.0.1,2.0.1");
 }
 

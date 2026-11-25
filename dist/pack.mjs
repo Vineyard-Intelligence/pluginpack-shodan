@@ -129,17 +129,18 @@ const keepNoted = new WeakMap();
  *     "network egress denied: GET <url>", whose URL carries the API key as ?key=. So status 0 is
  *     refused outright, and the object handed over is built afresh from status, headers and body:
  *     `r.error` and the URL never reach it;
- *   - `slice` replaces the body when one response describes several nodes (a search page, a DNS
- *     batch): each node gets its own part, not the others';
+ *   - only an original answer is kept: the response's own text, whole, on the one node it is
+ *     about. A part cut out of a search page or a DNS batch is not the answer Shodan sent, so those
+ *     call sites keep nothing rather than a slice (analyst's decision, 2026-11-25);
  *   - a refusal (over budget, a config value seen in the body) or a throw costs the raw copy, never
  *     the run: the mapped fields are already staged and are what the analyst ran this for.
  */
-async function keep(ctx, nodeId, op, r, slice) {
+async function keep(ctx, nodeId, op, r) {
   if (typeof ctx.retain !== "function" || !nodeId || !r || !(r.status > 0)) return;
   let reason = "";
   try {
-    // The response's own text when the whole answer is kept, so the host hashes the bytes Shodan sent.
-    const body = slice !== undefined ? slice : r.text ? await r.text() : r.body ?? null;
+    // The response's own text, so the host hashes the bytes Shodan sent.
+    const body = r.text ? await r.text() : r.body ?? null;
     const out = await ctx.retain(String(nodeId), op, { status: r.status, headers: { ...(r.headers || {}) }, body });
     if (out && out.kept === false) reason = typeof out.reason === "string" && out.reason ? out.reason : "refused";
   } catch {
@@ -760,15 +761,9 @@ const searchPlugin = {
     if (!matches.length) return { summary: `0 results for "${query}" (${total} total match Shodan's index)`, counts: { ips: 0 } };
 
     const aggregated = aggregateMatches(matches);
-    // The raw rows per IP, for keep(): one call per IP with all of its rows, because a host answers
-    // a search with one row per scanned port and each kept answer replaces the last, so one call
-    // per row would leave only the last port.
-    const rowsByIp = new Map();
-    for (const m of matches) {
-      if (!m || !m.ip_str) continue;
-      if (!rowsByIp.has(m.ip_str)) rowsByIp.set(m.ip_str, []);
-      rowsByIp.get(m.ip_str).push(m);
-    }
+    // No raw results here (analyst's decision, 2026-11-25): a search page describes up to 100
+    // hosts, and the rows cut out of it for one IP are no longer the answer Shodan sent. Shodan
+    // Host keeps the original answer for an IP when one is wanted.
     const asNodeByAsn = new Map();
     const totals = { ip: 0, host: 0, as: 0, domains: 0, vulns: 0, omitted: 0, geo: 0, certs: 0, favicons: 0, hostKeys: 0 };
     for (let i = 0; i < aggregated.length; i++) {
@@ -777,7 +772,6 @@ const searchPlugin = {
         ctx.progress.set &&
         ctx.progress.set({ percent: Math.round(((i + 1) / aggregated.length) * 100), message: aggregated[i].ip });
       const made = await writeIp(ctx, aggregated[i], asNodeByAsn);
-      await keep(ctx, made.ipId, "search", r, { total, matches: rowsByIp.get(aggregated[i].ip) || [] });
       if (made.ip) totals.ip++;
       if (made.host) totals.host++;
       if (made.as) totals.as++;
@@ -1059,9 +1053,11 @@ const dnsResolvePlugin = {
       const body = r.body || {};
       for (const name of batches[b]) {
         const ip = body[name];
-        // One answer covers up to 25 names; each domain keeps only its own entry, before the
-        // unresolved check, since "Shodan could not resolve it" is an answer too.
-        await keep(ctx, idByName.get(name), "resolve", r, { [name]: ip ?? null });
+        // Kept only when this request asked about this one name: then the answer, whole, is about
+        // it. An entry cut out of a batch of up to 25 is no longer the answer Shodan sent, so a
+        // batched answer is not kept at all. Before the unresolved check, since "Shodan could not
+        // resolve it" is an answer too.
+        if (batches[b].length === 1) await keep(ctx, idByName.get(name), "resolve", r);
         // A name Shodan cannot resolve comes back as an explicit null, not a missing key.
         if (!ip || typeof ip !== "string") {
           unresolved++;
@@ -1149,8 +1145,9 @@ const dnsReversePlugin = {
       const body = r.body || {};
       for (const ip of batches[b]) {
         const names = body[ip];
-        // Each address keeps only its own entry of the batch, no-PTR included (see dns_resolve).
-        await keep(ctx, idByIp.get(ip), "reverse", r, { [ip]: names ?? null });
+        // A one-address request keeps its answer whole, no-PTR included; a batch keeps nothing
+        // (see dns_resolve).
+        if (batches[b].length === 1) await keep(ctx, idByIp.get(ip), "reverse", r);
         // An address with no PTR comes back as an explicit null, not a missing key.
         if (!Array.isArray(names) || !names.length) {
           none++;
@@ -1254,7 +1251,7 @@ export default {
     identifier: "run.vineyard.pluginpacks.shodan",
     content_type: "vineyard:pluginpack",
     name: "Shodan",
-    version: "2.5.0",
+    version: "2.6.0",
     summary:
       "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
     description: PACK_PAGE,
