@@ -578,8 +578,9 @@ const DEVICE_CERT = {
 
 // ================================================================ raw results: ctx.retain
 // check:retain-feature-detect. Invariants, from the plugin raw results spec (§5, §9-1, §12):
-//   - Host keeps its answer on the selected IP, op "host": a 2xx, and the 404 "never scanned"
-//     answer too. DNS Domain keeps the answer on its domain, op "domain". Resolve and Reverse keep
+//   - Host keeps its answer on the selected IP, op "host", only a 2xx: the 404 "never scanned" and
+//     every other failure keep nothing, and neither does an empty DNS answer (analyst's decision,
+//     2026-11-25: they only add noise). DNS Domain keeps the answer on its domain, op "domain". Resolve and Reverse keep
 //     the answer whole when the request asked about one node, ops "resolve" and "reverse".
 //   - Where one answer describes several nodes, the part about each is an EXCERPT the host cuts
 //     (ctx.retainExcerpt, analyst's decision 2026-11-25): Search hands the page over with one
@@ -631,9 +632,8 @@ const DEVICE_CERT = {
     const nodes = { a: ip("a", "198.51.100.7"), b: ip("b", "192.0.2.1"), c: ip("c", "192.0.2.2") };
     const graph = makeGraph(nodes);
     const r = await hostPlugin.run({ config: SKEY, input: { selection: ["a", "b", "c"] }, net, graph, retain, ...RUN });
-    check("retain host: the 2xx and the 404 on their own IPs, op host; the 503 not", sig(retain.calls) === "a:host:200,b:host:404");
+    check("retain host: only the 2xx, on its own IP, op host; the 404 and the 503 keep nothing", sig(retain.calls) === "a:host:200");
     check("retain host: the whole answer as the text Shodan sent", typeof retain.calls[0][2].body === "string" && JSON.stringify(bodyOf(retain.calls[0])) === JSON.stringify(hostBody));
-    check("retain host: a 404 keeps Shodan's own error body", bodyOf(retain.calls[1]) && bodyOf(retain.calls[1]).error === "No information available for that IP.");
     check("retain host: the response's headers ride along for the host to filter", retain.calls[0][2].headers.etag === '"s-1"');
     check("retain host: a plain {status, headers, body}, nothing a worker cannot post", retain.calls.every((c) => Object.keys(c[2]).sort().join() === "body,headers,status"));
     check("retain host: no key, URL or error text in anything kept", leaks(retain.calls).length === 0);
@@ -708,6 +708,9 @@ const DEVICE_CERT = {
     const failed = spy();
     await dnsDomainPlugin.run({ config: SKEY, input: { selection: ["d"] }, net: makeNet(() => ({ status: 500, body: { error: "x" } })), graph: makeGraph({ d: dom("d", "example.test") }), retain: failed, ...RUN });
     check("retain dns_domain: a failed lookup keeps nothing", failed.calls.length === 0);
+    const emptyDomain = spy();
+    await dnsDomainPlugin.run({ config: SKEY, input: { selection: ["d"] }, net: makeNet(() => ({ status: 200, body: { subdomains: [], data: [] } })), graph: makeGraph({ d: dom("d", "example.test") }), retain: emptyDomain, ...RUN });
+    check("retain dns_domain: an answer with no subdomains and no records keeps nothing", emptyDomain.calls.length === 0);
 
     const res = spy();
     const resolveNodes = { d1: dom("d1", "a.example.test"), d2: dom("d2", "b.example.test"), d3: dom("d3", "a.example.test") };
@@ -716,18 +719,21 @@ const DEVICE_CERT = {
     const resEx = spy();
     const batchBody = { "a.example.test": "10.0.0.1", "b.example.test": null };
     await dnsResolvePlugin.run({ config: SKEY, input: { selection: ["d1", "d2", "d3"] }, net: makeNet(() => ({ status: 200, body: batchBody })), graph: makeGraph(resolveNodes), retain: spy(), retainExcerpt: resEx, ...RUN });
-    check("retain dns_resolve: a batch keeps each domain's entry as an excerpt, unresolved included", sig(resEx.calls) === "d1:resolve:200,d2:resolve:200" && JSON.stringify(resEx.calls.map((c) => c[3])) === JSON.stringify([["/a.example.test"], ["/b.example.test"]]) && resEx.calls.every((c) => JSON.stringify(bodyOf(c)) === JSON.stringify(batchBody)));
+    check("retain dns_resolve: a batch keeps each resolved domain's entry as an excerpt; an unresolved one keeps nothing", sig(resEx.calls) === "d1:resolve:200" && JSON.stringify(resEx.calls.map((c) => c[3])) === JSON.stringify([["/a.example.test"]]) && resEx.calls.every((c) => JSON.stringify(bodyOf(c)) === JSON.stringify(batchBody)));
     const one = spy();
-    const oneBody = { "b.example.test": null };
-    await dnsResolvePlugin.run({ config: SKEY, input: { selection: ["d2"] }, net: makeNet(() => ({ status: 200, body: oneBody })), graph: makeGraph(resolveNodes), retain: one, ...RUN });
-    check("retain dns_resolve: a one-name answer whole on its domain, unresolved included, op resolve", sig(one.calls) === "d2:resolve:200" && JSON.stringify(bodyOf(one.calls[0])) === JSON.stringify(oneBody));
+    const oneBody = { "a.example.test": "10.0.0.1" };
+    await dnsResolvePlugin.run({ config: SKEY, input: { selection: ["d1"] }, net: makeNet(() => ({ status: 200, body: oneBody })), graph: makeGraph(resolveNodes), retain: one, ...RUN });
+    check("retain dns_resolve: a one-name answer whole on its domain, op resolve", sig(one.calls) === "d1:resolve:200" && JSON.stringify(bodyOf(one.calls[0])) === JSON.stringify(oneBody));
+    const unresolved = spy();
+    await dnsResolvePlugin.run({ config: SKEY, input: { selection: ["d2"] }, net: makeNet(() => ({ status: 200, body: { "b.example.test": null } })), graph: makeGraph(resolveNodes), retain: unresolved, ...RUN });
+    check("retain dns_resolve: an unresolved name keeps nothing", unresolved.calls.length === 0);
 
     const rev = spy();
     await dnsReversePlugin.run({ config: SKEY, input: { selection: ["a", "b"] }, net: makeNet(() => ({ status: 200, body: { "8.8.8.8": ["dns.google"], "192.0.2.1": null } })), graph: makeGraph({ a: ip("a", "8.8.8.8"), b: ip("b", "192.0.2.1") }), retain: rev, ...RUN });
     check("retain dns_reverse: a batched answer is never kept whole", rev.calls.length === 0);
     const revEx = spy();
     await dnsReversePlugin.run({ config: SKEY, input: { selection: ["a", "b"] }, net: makeNet(() => ({ status: 200, body: { "8.8.8.8": ["dns.google"], "192.0.2.1": null } })), graph: makeGraph({ a: ip("a", "8.8.8.8"), b: ip("b", "192.0.2.1") }), retain: spy(), retainExcerpt: revEx, ...RUN });
-    check("retain dns_reverse: a batch keeps each IP's entry as an excerpt, no-PTR included", sig(revEx.calls) === "a:reverse:200,b:reverse:200" && JSON.stringify(revEx.calls.map((c) => c[3])) === JSON.stringify([["/8.8.8.8"], ["/192.0.2.1"]]));
+    check("retain dns_reverse: a batch keeps each IP's entry with a PTR as an excerpt; no PTR keeps nothing", sig(revEx.calls) === "a:reverse:200" && JSON.stringify(revEx.calls.map((c) => c[3])) === JSON.stringify([["/8.8.8.8"]]));
     const oneRev = spy();
     const revBody = { "8.8.8.8": ["dns.google"] };
     await dnsReversePlugin.run({ config: SKEY, input: { selection: ["a"] }, net: makeNet(() => ({ status: 200, body: revBody })), graph: makeGraph({ a: ip("a", "8.8.8.8") }), retain: oneRev, ...RUN });
@@ -758,7 +764,7 @@ const DEVICE_CERT = {
     check("retain throw: logged without the host's message", tlog.lines.some((l) => /Raw host result not kept/.test(l)) && !tlog.lines.some((l) => /blew up/.test(l)));
   }
   // ---- only the pack version moved, which is what the update check compares
-  check("pack version is 2.7.0", pack.manifest.version === "2.7.0");
+  check("pack version is 2.8.0", pack.manifest.version === "2.8.0");
   check("member versions unchanged", pack.plugins.map((p) => p.manifest.version).join() === "2.3.0,2.3.0,2.0.2,2.0.1,2.0.1,2.0.1,2.0.1");
 }
 

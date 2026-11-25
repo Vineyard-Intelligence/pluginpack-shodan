@@ -661,13 +661,10 @@ const hostPlugin = {
       if (isBadKey(r)) return { summary: keyMessage(r), counts: {} };
       if (!r.ok) {
         // 404 is the routine answer for an IP Shodan has never scanned — not an error to report as
-        // one, or every quiet host in a selection reads as a broken key.
-        // Kept as well (analyst's decision, 2026-11-25): "Shodan had nothing on this IP on this
-        // date" is itself a finding. Other failures say nothing about the IP and are not.
-        if (r.status === 404) {
-          unknown++;
-          await keep(ctx, ids[i], "host", r);
-        } else failed++;
+        // one, or every quiet host in a selection reads as a broken key. Not kept (analyst's
+        // decision, 2026-11-25): a miss or an error carries nothing about the IP.
+        if (r.status === 404) unknown++;
+        else failed++;
         continue;
       }
       await keep(ctx, ids[i], "host", r);
@@ -965,8 +962,10 @@ const dnsDomainPlugin = {
         failed++;
         continue;
       }
-      await keep(ctx, ids[i], "domain", r);
       const body = r.body || {};
+      // Only an answer with something in it: no subdomains and no records is an empty answer.
+      if ((Array.isArray(body.subdomains) && body.subdomains.length) || (Array.isArray(body.data) && body.data.length))
+        await keep(ctx, ids[i], "domain", r);
 
       // Subdomain nodes first, so the record loop below can edge a record to the exact name it
       // belongs to (the apex node passed in, or one of these) rather than always to the apex.
@@ -1091,11 +1090,12 @@ const dnsResolvePlugin = {
       for (const name of batches[b]) {
         const ip = body[name];
         // A one-name request keeps its answer whole; a batch of up to 25 keeps this name's entry
-        // as an excerpt the host cuts. Before the unresolved check, since "Shodan could not resolve
-        // it" is an answer too (an explicit null, present in the answer).
-        if (batches[b].length === 1) await keep(ctx, idByName.get(name), "resolve", r);
-        else if (Object.prototype.hasOwnProperty.call(body, name))
-          await keepExcerpt(ctx, idByName.get(name), "resolve", r, [`/${pointerToken(name)}`]);
+        // as an excerpt the host cuts. Only a name Shodan resolved: an unresolved one (an explicit
+        // null) is an empty answer and keeps nothing (analyst's decision, 2026-11-25).
+        if (ip && typeof ip === "string") {
+          if (batches[b].length === 1) await keep(ctx, idByName.get(name), "resolve", r);
+          else await keepExcerpt(ctx, idByName.get(name), "resolve", r, [`/${pointerToken(name)}`]);
+        }
         // A name Shodan cannot resolve comes back as an explicit null, not a missing key.
         if (!ip || typeof ip !== "string") {
           unresolved++;
@@ -1183,11 +1183,12 @@ const dnsReversePlugin = {
       const body = r.body || {};
       for (const ip of batches[b]) {
         const names = body[ip];
-        // A one-address request keeps its answer whole, no-PTR included; a batch keeps this
-        // address's entry as an excerpt (see dns_resolve).
-        if (batches[b].length === 1) await keep(ctx, idByIp.get(ip), "reverse", r);
-        else if (Object.prototype.hasOwnProperty.call(body, ip))
-          await keepExcerpt(ctx, idByIp.get(ip), "reverse", r, [`/${pointerToken(ip)}`]);
+        // A one-address request keeps its answer whole; a batch keeps this address's entry as an
+        // excerpt (see dns_resolve). An address with no PTR keeps nothing.
+        if (Array.isArray(names) && names.length) {
+          if (batches[b].length === 1) await keep(ctx, idByIp.get(ip), "reverse", r);
+          else await keepExcerpt(ctx, idByIp.get(ip), "reverse", r, [`/${pointerToken(ip)}`]);
+        }
         // An address with no PTR comes back as an explicit null, not a missing key.
         if (!Array.isArray(names) || !names.length) {
           none++;
@@ -1291,7 +1292,7 @@ export default {
     identifier: "run.vineyard.pluginpacks.shodan",
     content_type: "vineyard:pluginpack",
     name: "Shodan",
-    version: "2.7.0",
+    version: "2.8.0",
     summary:
       "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
     description: PACK_PAGE,
