@@ -129,9 +129,9 @@ const keepNoted = new WeakMap();
  *     "network egress denied: GET <url>", whose URL carries the API key as ?key=. So status 0 is
  *     refused outright, and the object handed over is built afresh from status, headers and body:
  *     `r.error` and the URL never reach it;
- *   - only an original answer is kept: the response's own text, whole, on the one node it is
- *     about. A part cut out of a search page or a DNS batch is not the answer Shodan sent, so those
- *     call sites keep nothing rather than a slice (analyst's decision, 2026-11-25);
+ *   - the body is always the response's own text, whole. Where one answer describes several nodes
+ *     (a search page, a DNS batch), keepExcerpt hands the whole answer over with pointers to the
+ *     part about the node, and the HOST cuts it and marks it an excerpt;
  *   - a refusal (over budget, a config value seen in the body) or a throw costs the raw copy, never
  *     the run: the mapped fields are already staged and are what the analyst ran this for.
  */
@@ -142,6 +142,34 @@ async function keep(ctx, nodeId, op, r) {
     // The response's own text, so the host hashes the bytes Shodan sent.
     const body = r.text ? await r.text() : r.body ?? null;
     const out = await ctx.retain(String(nodeId), op, { status: r.status, headers: { ...(r.headers || {}) }, body });
+    if (out && out.kept === false) reason = typeof out.reason === "string" && out.reason ? out.reason : "refused";
+  } catch {
+    reason = "the host could not keep it";
+  }
+  if (!reason) return;
+  let noted = keepNoted.get(ctx);
+  if (!noted) keepNoted.set(ctx, (noted = new Set()));
+  if (noted.has(`${op}\0${reason}`)) return;
+  noted.add(`${op}\0${reason}`);
+  ctx.progress && ctx.progress.log && ctx.progress.log(`Raw ${op} result not kept — ${reason}`);
+}
+
+/** A JSON Pointer token: "~" and "/" escaped (RFC 6901), for a hostname or address used as a key. */
+const pointerToken = (s) => String(s).replace(/~/g, "~0").replace(/\//g, "~1");
+
+/**
+ * Keep the part of one answer that is about one node (analyst's decision, 2026-11-25): the whole
+ * response goes to the host with JSON Pointers to that part, and the host cuts it, records the
+ * pointers and keeps the whole answer's hash and size, so it reads as an excerpt, never as what
+ * Shodan said about the node. Only through ctx.retainExcerpt: a host without it would keep the whole
+ * page on every node through retain, so nothing is kept there. Refusals as keep().
+ */
+async function keepExcerpt(ctx, nodeId, op, r, pointers) {
+  if (typeof ctx.retainExcerpt !== "function" || !nodeId || !r || !(r.status > 0) || !pointers.length) return;
+  let reason = "";
+  try {
+    const body = r.text ? await r.text() : r.body ?? null;
+    const out = await ctx.retainExcerpt(String(nodeId), op, { status: r.status, headers: { ...(r.headers || {}) }, body }, pointers);
     if (out && out.kept === false) reason = typeof out.reason === "string" && out.reason ? out.reason : "refused";
   } catch {
     reason = "the host could not keep it";
@@ -761,9 +789,17 @@ const searchPlugin = {
     if (!matches.length) return { summary: `0 results for "${query}" (${total} total match Shodan's index)`, counts: { ips: 0 } };
 
     const aggregated = aggregateMatches(matches);
-    // No raw results here (analyst's decision, 2026-11-25): a search page describes up to 100
-    // hosts, and the rows cut out of it for one IP are no longer the answer Shodan sent. Shodan
-    // Host keeps the original answer for an IP when one is wanted.
+    // Each IP keeps its rows of the page as an excerpt (keepExcerpt): one pointer per row, because
+    // Shodan answers a search with one row per scanned port, and a kept call replaces the last, so
+    // one call per row would leave only the last port. The indices are the page's own, so the host
+    // cuts from the answer as sent.
+    const rowsAt = new Map();
+    for (let m = 0; m < matches.length; m++) {
+      const ipStr = matches[m] && matches[m].ip_str;
+      if (!ipStr) continue;
+      if (!rowsAt.has(ipStr)) rowsAt.set(ipStr, []);
+      rowsAt.get(ipStr).push(`/matches/${m}`);
+    }
     const asNodeByAsn = new Map();
     const totals = { ip: 0, host: 0, as: 0, domains: 0, vulns: 0, omitted: 0, geo: 0, certs: 0, favicons: 0, hostKeys: 0 };
     for (let i = 0; i < aggregated.length; i++) {
@@ -772,6 +808,7 @@ const searchPlugin = {
         ctx.progress.set &&
         ctx.progress.set({ percent: Math.round(((i + 1) / aggregated.length) * 100), message: aggregated[i].ip });
       const made = await writeIp(ctx, aggregated[i], asNodeByAsn);
+      await keepExcerpt(ctx, made.ipId, "search", r, rowsAt.get(aggregated[i].ip) || []);
       if (made.ip) totals.ip++;
       if (made.host) totals.host++;
       if (made.as) totals.as++;
@@ -1053,11 +1090,12 @@ const dnsResolvePlugin = {
       const body = r.body || {};
       for (const name of batches[b]) {
         const ip = body[name];
-        // Kept only when this request asked about this one name: then the answer, whole, is about
-        // it. An entry cut out of a batch of up to 25 is no longer the answer Shodan sent, so a
-        // batched answer is not kept at all. Before the unresolved check, since "Shodan could not
-        // resolve it" is an answer too.
+        // A one-name request keeps its answer whole; a batch of up to 25 keeps this name's entry
+        // as an excerpt the host cuts. Before the unresolved check, since "Shodan could not resolve
+        // it" is an answer too (an explicit null, present in the answer).
         if (batches[b].length === 1) await keep(ctx, idByName.get(name), "resolve", r);
+        else if (Object.prototype.hasOwnProperty.call(body, name))
+          await keepExcerpt(ctx, idByName.get(name), "resolve", r, [`/${pointerToken(name)}`]);
         // A name Shodan cannot resolve comes back as an explicit null, not a missing key.
         if (!ip || typeof ip !== "string") {
           unresolved++;
@@ -1145,9 +1183,11 @@ const dnsReversePlugin = {
       const body = r.body || {};
       for (const ip of batches[b]) {
         const names = body[ip];
-        // A one-address request keeps its answer whole, no-PTR included; a batch keeps nothing
-        // (see dns_resolve).
+        // A one-address request keeps its answer whole, no-PTR included; a batch keeps this
+        // address's entry as an excerpt (see dns_resolve).
         if (batches[b].length === 1) await keep(ctx, idByIp.get(ip), "reverse", r);
+        else if (Object.prototype.hasOwnProperty.call(body, ip))
+          await keepExcerpt(ctx, idByIp.get(ip), "reverse", r, [`/${pointerToken(ip)}`]);
         // An address with no PTR comes back as an explicit null, not a missing key.
         if (!Array.isArray(names) || !names.length) {
           none++;
@@ -1251,7 +1291,7 @@ export default {
     identifier: "run.vineyard.pluginpacks.shodan",
     content_type: "vineyard:pluginpack",
     name: "Shodan",
-    version: "2.6.0",
+    version: "2.7.0",
     summary:
       "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
     description: PACK_PAGE,
