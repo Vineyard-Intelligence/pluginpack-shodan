@@ -55,7 +55,7 @@ function makeNet(respond) {
       return {
         ok: r.status >= 200 && r.status < 300,
         status: r.status,
-        headers: {},
+        headers: r.headers ?? {},
         async text() {
           return r.html ?? JSON.stringify(r.body ?? {});
         },
@@ -574,6 +574,166 @@ const DEVICE_CERT = {
   check("status: no graph scope means no graph calls happen", graph.createdNodes.length === 0);
   check("status: reports the plan and credits", /dev/.test(r.summary) && /97/.test(r.summary));
   check("status: counts carry the raw numbers for the caller", r.counts.query_credits === 97);
+}
+
+// ================================================================ raw results: ctx.retain
+// check:retain-feature-detect. Invariants, from the plugin raw results spec (§5, §9-1, §12):
+//   - Host keeps its answer on the selected IP, op "host": a 2xx, and the 404 "never scanned"
+//     answer too. Search keeps one call per IP, op "search", with that IP's raw rows. DNS Domain keeps
+//     the answer on its domain, op "domain"; Resolve and Reverse keep each node's own entry of the
+//     batch, {[name]: value}, ops "resolve" and "reverse".
+//   - Count and API Status never keep anything: no node, and /api-info is the account itself.
+//   - Status 0 (cancelled, refused, network error) is never kept. Its error can be the host's
+//     "network egress denied: GET <url>" with the key in ?key=, so nothing handed to retain may
+//     contain the key, a URL, or that message.
+//   - A refusal object or a throw from retain never fails the run, and is logged once per reason.
+//   - A host without ctx.retain (every desktop build before it) runs exactly as before.
+{
+  const SECRET = "shodan-SECRET-key-0123456789";
+  const SKEY = { api_key: SECRET };
+  const HEADERS = { "content-type": "application/json", etag: '"s-1"' };
+  const spy = (answer = async () => ({ kept: true })) => {
+    const calls = [];
+    const fn = async (...args) => {
+      calls.push(args);
+      return answer(...args);
+    };
+    fn.calls = calls;
+    return fn;
+  };
+  const leaks = (calls) => {
+    const s = JSON.stringify(calls);
+    return [SECRET, "key=", "http://", "https://", "api.shodan.io", "egress denied"].filter((x) => s.includes(x));
+  };
+  const bodyOf = (c) => (typeof (c && c[2] && c[2].body) === "string" ? JSON.parse(c[2].body) : c && c[2] && c[2].body);
+  const sig = (calls) => calls.map((c) => `${c[0]}:${c[1]}:${c[2].status}`).join();
+  const logsOf = () => {
+    const lines = [];
+    return { lines, progress: { set() {}, log: (m) => lines.push(m) } };
+  };
+  const ip = (id, v) => ({ id, type: "infrastructure.ip_address", data: { ip_address: v } });
+  const dom = (id, v) => ({ id, type: "infrastructure.domain", data: { domain_name: v } });
+  const hostBody = { ip_str: "198.51.100.7", ports: [80], data: [{ port: 80, product: "nginx" }], asn: "AS64500", org: "Example" };
+
+  // ---- host: 2xx and 404 kept on the selected IP, everything else not
+  {
+    const retain = spy();
+    const net = makeNet((url) =>
+      url.pathname.endsWith("198.51.100.7")
+        ? { status: 200, body: hostBody, headers: HEADERS }
+        : url.pathname.endsWith("192.0.2.1")
+          ? { status: 404, body: { error: "No information available for that IP." } }
+          : { status: 503, body: { error: "upstream" } },
+    );
+    const nodes = { a: ip("a", "198.51.100.7"), b: ip("b", "192.0.2.1"), c: ip("c", "192.0.2.2") };
+    const graph = makeGraph(nodes);
+    const r = await hostPlugin.run({ config: SKEY, input: { selection: ["a", "b", "c"] }, net, graph, retain, ...RUN });
+    check("retain host: the 2xx and the 404 on their own IPs, op host; the 503 not", sig(retain.calls) === "a:host:200,b:host:404");
+    check("retain host: the whole answer as the text Shodan sent", typeof retain.calls[0][2].body === "string" && JSON.stringify(bodyOf(retain.calls[0])) === JSON.stringify(hostBody));
+    check("retain host: a 404 keeps Shodan's own error body", bodyOf(retain.calls[1]) && bodyOf(retain.calls[1]).error === "No information available for that IP.");
+    check("retain host: the response's headers ride along for the host to filter", retain.calls[0][2].headers.etag === '"s-1"');
+    check("retain host: a plain {status, headers, body}, nothing a worker cannot post", retain.calls.every((c) => Object.keys(c[2]).sort().join() === "body,headers,status"));
+    check("retain host: no key, URL or error text in anything kept", leaks(retain.calls).length === 0);
+    check("retain host: the request really carried the key", net.calls.some((u) => u.includes(`key=${SECRET}`)));
+    check("retain host: counts unchanged", r.counts.hosts === 1 && r.counts.unknown === 1 && r.counts.failed === 1);
+
+    // The same run on a host without retain.
+    const oldLog = logsOf();
+    const oldGraph = makeGraph(nodes);
+    const old = await hostPlugin.run({ config: SKEY, input: { selection: ["a", "b", "c"] }, net: makeNet((url) =>
+      url.pathname.endsWith("198.51.100.7") ? { status: 200, body: hostBody } : url.pathname.endsWith("192.0.2.1") ? { status: 404, body: {} } : { status: 503, body: {} },
+    ), graph: oldGraph, progress: oldLog.progress, ...RUN });
+    check("old host: no ctx.retain, Host runs as before", JSON.stringify(old) === JSON.stringify(r) && JSON.stringify(oldGraph.createdNodes) === JSON.stringify(graph.createdNodes));
+    check("old host: says nothing about raw results", !oldLog.lines.some((l) => /not kept/.test(l)));
+    const notFn = await hostPlugin.run({ config: SKEY, input: { selection: ["a"] }, net: makeNet(() => ({ status: 200, body: hostBody })), graph: makeGraph(nodes), retain: true, ...RUN }).catch((e) => e);
+    check("old host: a retain that is not a function is left alone", !(notFn instanceof Error) && notFn.counts.hosts === 1);
+  }
+  // ---- status 0: the egress refusal carries the key in its URL, and is never kept
+  {
+    for (const [name, plugin, selection] of [
+      ["host", hostPlugin, ["a"]],
+      ["search", searchPlugin, []],
+      ["dns_domain", dnsDomainPlugin, ["d"]],
+      ["dns_resolve", dnsResolvePlugin, ["d"]],
+      ["dns_reverse", dnsReversePlugin, ["a"]],
+    ]) {
+      const retain = spy();
+      const net = makeNet((url) => {
+        throw new Error(`network egress denied: GET ${url.toString()}`);
+      });
+      const res = await plugin.run({ config: SKEY, params: { query: "q" }, input: { selection }, net, graph: makeGraph({ a: ip("a", "192.0.2.9"), d: dom("d", "example.test") }), retain, ...RUN }).catch((e) => e);
+      check(`retain ${name}: a status-0 request keeps nothing`, !(res instanceof Error) && retain.calls.length === 0);
+    }
+    const cancelled = spy();
+    await hostPlugin.run({ config: SKEY, input: { selection: ["a"] }, net: makeNet(() => ({ status: 200, body: hostBody })), graph: makeGraph({ a: ip("a", "192.0.2.9") }), retain: cancelled, signal: { aborted: true } });
+    check("retain host: a cancelled run keeps nothing", cancelled.calls.length === 0);
+    for (const [name, plugin] of [["host", hostPlugin], ["dns_reverse", dnsReversePlugin]]) {
+      const retain = spy();
+      await plugin.run({ config: SKEY, input: { selection: ["a"] }, net: makeNet(() => ({ status: 401, html: "<html>401</html>" })), graph: makeGraph({ a: ip("a", "192.0.2.9") }), retain, ...RUN });
+      check(`retain ${name}: a rejected key keeps nothing`, retain.calls.length === 0);
+    }
+  }
+  // ---- search: once per IP, with that IP's raw rows
+  {
+    const retain = spy();
+    const matches = [
+      { ip_str: "1.2.3.4", port: 80, _shodan: { module: "http" } },
+      { ip_str: "5.6.7.8", port: 22 },
+      { ip_str: "1.2.3.4", port: 443 },
+    ];
+    const graph = makeGraph({});
+    await searchPlugin.run({ config: SKEY, params: { query: "org:test" }, input: { selection: [] }, net: makeNet(() => ({ status: 200, body: { matches, total: 3 }, headers: HEADERS })), graph, retain, ...RUN });
+    const ipNode = (v) => graph.createdNodes.find((n) => n.type === "infrastructure.ip_address" && n.data.ip_address === v);
+    check("retain search: one call per IP, on the IP node it created, op search", sig(retain.calls) === `${ipNode("1.2.3.4").id}:search:200,${ipNode("5.6.7.8").id}:search:200`);
+    check("retain search: each IP keeps all of its rows and only its rows", JSON.stringify(bodyOf(retain.calls[0])) === JSON.stringify({ total: 3, matches: [matches[0], matches[2]] }) && JSON.stringify(bodyOf(retain.calls[1])) === JSON.stringify({ total: 3, matches: [matches[1]] }));
+    check("retain search: no key or URL in anything kept", leaks(retain.calls).length === 0);
+  }
+  // ---- DNS: the domain answer whole; resolve and reverse per node
+  {
+    const retain = spy();
+    const body = { subdomains: ["www"], data: [{ subdomain: "www", type: "A", value: "1.2.3.4" }] };
+    await dnsDomainPlugin.run({ config: SKEY, input: { selection: ["d"] }, net: makeNet(() => ({ status: 200, body })), graph: makeGraph({ d: dom("d", "example.test") }), retain, ...RUN });
+    check("retain dns_domain: the answer on its domain, op domain", sig(retain.calls) === "d:domain:200" && JSON.stringify(bodyOf(retain.calls[0])) === JSON.stringify(body));
+    const failed = spy();
+    await dnsDomainPlugin.run({ config: SKEY, input: { selection: ["d"] }, net: makeNet(() => ({ status: 500, body: { error: "x" } })), graph: makeGraph({ d: dom("d", "example.test") }), retain: failed, ...RUN });
+    check("retain dns_domain: a failed lookup keeps nothing", failed.calls.length === 0);
+
+    const res = spy();
+    const resolveNodes = { d1: dom("d1", "a.example.test"), d2: dom("d2", "b.example.test"), d3: dom("d3", "a.example.test") };
+    await dnsResolvePlugin.run({ config: SKEY, input: { selection: ["d1", "d2", "d3"] }, net: makeNet(() => ({ status: 200, body: { "a.example.test": "10.0.0.1", "b.example.test": null } })), graph: makeGraph(resolveNodes), retain: res, ...RUN });
+    check("retain dns_resolve: each domain its own entry, unresolved included, op resolve", sig(res.calls) === "d1:resolve:200,d2:resolve:200" && JSON.stringify(bodyOf(res.calls[0])) === '{"a.example.test":"10.0.0.1"}' && JSON.stringify(bodyOf(res.calls[1])) === '{"b.example.test":null}');
+
+    const rev = spy();
+    await dnsReversePlugin.run({ config: SKEY, input: { selection: ["a", "b"] }, net: makeNet(() => ({ status: 200, body: { "8.8.8.8": ["dns.google"], "192.0.2.1": null } })), graph: makeGraph({ a: ip("a", "8.8.8.8"), b: ip("b", "192.0.2.1") }), retain: rev, ...RUN });
+    check("retain dns_reverse: each IP its own entry, no-PTR included, op reverse", sig(rev.calls) === "a:reverse:200,b:reverse:200" && JSON.stringify(bodyOf(rev.calls[0])) === '{"8.8.8.8":["dns.google"]}' && JSON.stringify(bodyOf(rev.calls[1])) === '{"192.0.2.1":null}');
+    check("retain dns: no key or URL in anything kept", leaks([...retain.calls, ...res.calls, ...rev.calls]).length === 0);
+  }
+  // ---- Count and API Status never keep
+  {
+    const retain = spy();
+    await countPlugin.run({ config: SKEY, params: { query: "q" }, input: { selection: ["a"] }, net: makeNet(() => ({ status: 200, body: { total: 5, facets: {} } })), graph: makeGraph({ a: ip("a", "1.2.3.4") }), retain, ...RUN });
+    await statusPlugin.run({ config: SKEY, input: { selection: ["a"] }, net: makeNet(() => ({ status: 200, body: { plan: "dev", query_credits: 1 } })), graph: makeGraph({ a: ip("a", "1.2.3.4") }), retain, ...RUN });
+    check("retain: Count and API Status never keep anything", retain.calls.length === 0);
+  }
+  // ---- a refusal or a throw costs the raw copy, never the run
+  {
+    const log = logsOf();
+    const refuse = spy(async () => ({ kept: false, reason: "over this run's raw-result budget" }));
+    const matches = [{ ip_str: "1.1.1.1", port: 80 }, { ip_str: "2.2.2.2", port: 80 }, { ip_str: "3.3.3.3", port: 80 }];
+    const r = await searchPlugin.run({ config: SKEY, params: { query: "q" }, input: { selection: [] }, net: makeNet(() => ({ status: 200, body: { matches, total: 3 } })), graph: makeGraph({}), retain: refuse, progress: log.progress, ...RUN }).catch((e) => e);
+    check("retain refusal: the search still succeeds", !(r instanceof Error) && r.counts.ips === 3 && refuse.calls.length === 3);
+    check("retain refusal: said once, not once per IP", log.lines.filter((l) => /Raw search result not kept — over this run's raw-result budget/.test(l)).length === 1);
+    const tlog = logsOf();
+    const thrower = spy(async () => {
+      throw new Error("host blew up");
+    });
+    const h = await hostPlugin.run({ config: SKEY, input: { selection: ["a"] }, net: makeNet(() => ({ status: 200, body: hostBody })), graph: makeGraph({ a: ip("a", "198.51.100.7") }), retain: thrower, progress: tlog.progress, ...RUN }).catch((e) => e);
+    check("retain throw: the lookup still succeeds", !(h instanceof Error) && h.counts.hosts === 1);
+    check("retain throw: logged without the host's message", tlog.lines.some((l) => /Raw host result not kept/.test(l)) && !tlog.lines.some((l) => /blew up/.test(l)));
+  }
+  // ---- only the pack version moved, which is what the update check compares
+  check("pack version is 2.5.0", pack.manifest.version === "2.5.0");
+  check("member versions unchanged", pack.plugins.map((p) => p.manifest.version).join() === "2.3.0,2.3.0,2.0.2,2.0.1,2.0.1,2.0.1,2.0.1");
 }
 
 // ================================================================ manifest: JS literal vs. JSON

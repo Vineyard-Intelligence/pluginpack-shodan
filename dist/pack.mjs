@@ -72,11 +72,14 @@ const chunk = (arr, n) => {
 /**
  * GET one Shodan endpoint with the key attached, one 429 retry, and a uniform result shape.
  *
- * Returns { ok, status, body, error } rather than throwing: every caller needs to tell "no data
- * for this input" (a clean 4xx with a JSON `error` — measured: `{"error":"No information available
+ * Returns { ok, status, headers, body, error } rather than throwing: every caller needs to tell
+ * "no data for this input" (a clean 4xx with a JSON `error` — measured: `{"error":"No information available
  * for that IP."}` at 404 is the normal answer for a quiet host, not a failure) from "the request
  * itself failed" (network, abort, an HTML error page from a layer in front of the API — measured:
  * a bad key's 401 is HTML, not JSON, so `.json()` there throws and `body` stays null).
+ *
+ * `headers` and `text` (the response's own text, read on demand) are there for keep() alone, and
+ * only on a response that arrived: status 0 carries neither.
  */
 async function shodanGet(ctx, path, params) {
   const url = new URL(path, API);
@@ -103,10 +106,51 @@ async function shodanGet(ctx, path, params) {
     } catch {
       /* non-JSON body (an HTML error page from a layer in front of the API) — body stays null */
     }
-    if (!res.ok) return { ok: false, status: res.status, body, error: (body && body.error) || `HTTP ${res.status}` };
-    return { ok: true, status: res.status, body };
+    const headers = res.headers && typeof res.headers === "object" ? res.headers : {};
+    const text = typeof res.text === "function" ? () => res.text() : undefined;
+    if (!res.ok) return { ok: false, status: res.status, headers, text, body, error: (body && body.error) || `HTTP ${res.status}` };
+    return { ok: true, status: res.status, headers, text, body };
   }
   return { ok: false, status: 429, error: "rate limited" };
+}
+
+// ---- shared: raw results ----------------------------------------------------------------------
+
+/** Refusals already logged in this run, so a budget refusal over 100 IPs is one line, not 100. */
+const keepNoted = new WeakMap();
+
+/**
+ * Keep a call's raw answer on the node it describes (plugin raw results). Every call site goes
+ * through here, because:
+ *   - desktop builds before ctx.retain have none, and a bare call there is a TypeError that would
+ *     fail a run that otherwise works, so the check is `typeof`, not truthiness;
+ *   - status 0 is never a response. It is shodanGet's own record of a request that did not happen
+ *     (cancelled, refused by the host, a network error), and its `error` can be the host's
+ *     "network egress denied: GET <url>", whose URL carries the API key as ?key=. So status 0 is
+ *     refused outright, and the object handed over is built afresh from status, headers and body:
+ *     `r.error` and the URL never reach it;
+ *   - `slice` replaces the body when one response describes several nodes (a search page, a DNS
+ *     batch): each node gets its own part, not the others';
+ *   - a refusal (over budget, a config value seen in the body) or a throw costs the raw copy, never
+ *     the run: the mapped fields are already staged and are what the analyst ran this for.
+ */
+async function keep(ctx, nodeId, op, r, slice) {
+  if (typeof ctx.retain !== "function" || !nodeId || !r || !(r.status > 0)) return;
+  let reason = "";
+  try {
+    // The response's own text when the whole answer is kept, so the host hashes the bytes Shodan sent.
+    const body = slice !== undefined ? slice : r.text ? await r.text() : r.body ?? null;
+    const out = await ctx.retain(String(nodeId), op, { status: r.status, headers: { ...(r.headers || {}) }, body });
+    if (out && out.kept === false) reason = typeof out.reason === "string" && out.reason ? out.reason : "refused";
+  } catch {
+    reason = "the host could not keep it";
+  }
+  if (!reason) return;
+  let noted = keepNoted.get(ctx);
+  if (!noted) keepNoted.set(ctx, (noted = new Set()));
+  if (noted.has(`${op}\0${reason}`)) return;
+  noted.add(`${op}\0${reason}`);
+  ctx.progress && ctx.progress.log && ctx.progress.log(`Raw ${op} result not kept — ${reason}`);
 }
 
 /** The one message every plugin gives for a key problem, so it reads the same everywhere. */
@@ -345,8 +389,9 @@ function aggregateHost(body) {
   return a;
 }
 
-/** Write one aggregated IP and everything hanging off it. Returns which node kinds it produced.
- *  `ipId` pins the IP to a node that already exists (the selected one) instead of creating a
+/** Write one aggregated IP and everything hanging off it. Returns which node kinds it produced,
+ *  and `ipId`, the IP node it wrote, so the caller can keep the raw answer on it.
+ *  `existingIpId` pins the IP to a node that already exists (the selected one) instead of creating a
  *  second; identity would merge them anyway, but reusing the selection keeps the edges attached to
  *  what the analyst is looking at. */
 async function writeIp(ctx, agg, asNodeByAsn, existingIpId) {
@@ -386,6 +431,7 @@ async function writeIp(ctx, agg, asNodeByAsn, existingIpId) {
     ipId = String(ipNode.id);
     made.ip = true;
   }
+  made.ipId = ipId;
 
   if (agg.ports.size) {
     const hostNode = await ctx.graph.createNode({
@@ -587,10 +633,15 @@ const hostPlugin = {
       if (!r.ok) {
         // 404 is the routine answer for an IP Shodan has never scanned — not an error to report as
         // one, or every quiet host in a selection reads as a broken key.
-        if (r.status === 404) unknown++;
-        else failed++;
+        // Kept as well (analyst's decision, 2026-11-25): "Shodan had nothing on this IP on this
+        // date" is itself a finding. Other failures say nothing about the IP and are not.
+        if (r.status === 404) {
+          unknown++;
+          await keep(ctx, ids[i], "host", r);
+        } else failed++;
         continue;
       }
+      await keep(ctx, ids[i], "host", r);
       const body = r.body || {};
       for (const t of body.tags || []) if (t) tags.add(String(t));
       for (const s of body.data || []) {
@@ -709,6 +760,15 @@ const searchPlugin = {
     if (!matches.length) return { summary: `0 results for "${query}" (${total} total match Shodan's index)`, counts: { ips: 0 } };
 
     const aggregated = aggregateMatches(matches);
+    // The raw rows per IP, for keep(): one call per IP with all of its rows, because a host answers
+    // a search with one row per scanned port and each kept answer replaces the last, so one call
+    // per row would leave only the last port.
+    const rowsByIp = new Map();
+    for (const m of matches) {
+      if (!m || !m.ip_str) continue;
+      if (!rowsByIp.has(m.ip_str)) rowsByIp.set(m.ip_str, []);
+      rowsByIp.get(m.ip_str).push(m);
+    }
     const asNodeByAsn = new Map();
     const totals = { ip: 0, host: 0, as: 0, domains: 0, vulns: 0, omitted: 0, geo: 0, certs: 0, favicons: 0, hostKeys: 0 };
     for (let i = 0; i < aggregated.length; i++) {
@@ -717,6 +777,7 @@ const searchPlugin = {
         ctx.progress.set &&
         ctx.progress.set({ percent: Math.round(((i + 1) / aggregated.length) * 100), message: aggregated[i].ip });
       const made = await writeIp(ctx, aggregated[i], asNodeByAsn);
+      await keep(ctx, made.ipId, "search", r, { total, matches: rowsByIp.get(aggregated[i].ip) || [] });
       if (made.ip) totals.ip++;
       if (made.host) totals.host++;
       if (made.as) totals.as++;
@@ -873,6 +934,7 @@ const dnsDomainPlugin = {
         failed++;
         continue;
       }
+      await keep(ctx, ids[i], "domain", r);
       const body = r.body || {};
 
       // Subdomain nodes first, so the record loop below can edge a record to the exact name it
@@ -997,6 +1059,9 @@ const dnsResolvePlugin = {
       const body = r.body || {};
       for (const name of batches[b]) {
         const ip = body[name];
+        // One answer covers up to 25 names; each domain keeps only its own entry, before the
+        // unresolved check, since "Shodan could not resolve it" is an answer too.
+        await keep(ctx, idByName.get(name), "resolve", r, { [name]: ip ?? null });
         // A name Shodan cannot resolve comes back as an explicit null, not a missing key.
         if (!ip || typeof ip !== "string") {
           unresolved++;
@@ -1084,6 +1149,8 @@ const dnsReversePlugin = {
       const body = r.body || {};
       for (const ip of batches[b]) {
         const names = body[ip];
+        // Each address keeps only its own entry of the batch, no-PTR included (see dns_resolve).
+        await keep(ctx, idByIp.get(ip), "reverse", r, { [ip]: names ?? null });
         // An address with no PTR comes back as an explicit null, not a missing key.
         if (!Array.isArray(names) || !names.length) {
           none++;
@@ -1187,7 +1254,7 @@ export default {
     identifier: "run.vineyard.pluginpacks.shodan",
     content_type: "vineyard:pluginpack",
     name: "Shodan",
-    version: "2.4.1",
+    version: "2.5.0",
     summary:
       "Shodan REST API lookups: IP host details, host search and result counts, passive DNS, forward and reverse DNS, and API credit status. Needs your own Shodan API key; only Shodan Search spends query credits.",
     description: PACK_PAGE,
